@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Premium Market V4: Render persistent SQLite, webhook, XTR + automatic delivery.
+"""Premium Market V5 (bir fayl): Render persistent SQLite, xavfsiz UZS sinov navbati.
 
 Real orders are disabled until the owner turns on live delivery.
 Never host a money-handling SQLite bot on ephemeral/serverless filesystems.
@@ -27,6 +27,175 @@ load_dotenv()
 import telebot
 from flask import Flask, abort, jsonify, request
 from telebot import types
+# UZSQueue birlashtirilgan: alohida uzs_queue.py kerak emas.
+"""Sequential UZS request queue. **AUDIT/DEMO ONLY**.
+
+For Telegram digital goods user checkout, XTR is required. Bank-chat notifications
+are NOT merchant proofs. This queue never credits balances or fulfills products.
+Provides fair first-in-first-out serial slots, deduplicated events and a safe
+SQLite transaction boundary; it can later be reused for a permitted payment use
+case with an authenticated bank/merchant webhook.
+"""
+import sqlite3
+import time
+from contextlib import closing
+
+
+class UZSQueue:
+    OPEN = ('queued', 'active', 'observed')
+    def __init__(self, path):
+        self.path = str(path)
+
+    def _db(self):
+        c = sqlite3.connect(self.path, timeout=20, isolation_level=None)
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA busy_timeout=20000')
+        return c
+
+    def init(self):
+        with closing(self._db()) as c:
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS uzs_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid INTEGER NOT NULL,
+                amount INTEGER NOT NULL CHECK(amount>=200),
+                status TEXT NOT NULL CHECK(status IN
+                ('queued','active','observed','expired','cancelled','reviewed')),
+                created INTEGER NOT NULL,
+                activated INTEGER NOT NULL DEFAULT 0,
+                expires INTEGER NOT NULL DEFAULT 0,
+                bank_chat_id INTEGER,
+                bank_message_id INTEGER,
+                view_message_id INTEGER,
+                last_view TEXT NOT NULL DEFAULT ''
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_only_one_active
+                ON uzs_queue(status) WHERE status='active';
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_one_open_per_user
+                ON uzs_queue(uid) WHERE status IN ('queued','active','observed');
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_observed_bank_event
+                ON uzs_queue(bank_chat_id,bank_message_id)
+                WHERE bank_chat_id IS NOT NULL AND bank_message_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS uzs_queue_order ON uzs_queue(status,created,id);
+            ''')
+
+    def _advance(self, c, now, duration_s):
+        c.execute('''UPDATE uzs_queue SET status='expired'
+                     WHERE status='active' AND expires<=?''', (now,))
+        current = c.execute("SELECT id FROM uzs_queue WHERE status IN ('active','observed')").fetchone()
+        if current:
+            return None
+        nxt = c.execute('SELECT id FROM uzs_queue WHERE status="queued" '
+                        'ORDER BY created,id LIMIT 1').fetchone()
+        if not nxt:
+            return None
+        c.execute('''UPDATE uzs_queue SET status='active', activated=?,expires=?
+                     WHERE id=? AND status='queued' ''',
+                  (now,now+duration_s,nxt['id']))
+        return nxt['id']
+
+    def advance(self, duration_s, now=None):
+        now = int(time.time()) if now is None else int(now)
+        if not 60<=int(duration_s)<=3600:
+            raise ValueError('Kutish vaqti 1–60 daqiqa')
+        with closing(self._db()) as c:
+            c.execute('BEGIN IMMEDIATE')
+            nxt = self._advance(c,now,int(duration_s))
+            c.execute('COMMIT')
+        return nxt
+
+    def join(self, uid, amount, duration_s, now=None):
+        now = int(time.time()) if now is None else int(now)
+        if not 200<=int(amount)<=50_000_000:
+            raise ValueError('200–50 000 000 so‘m oralig‘ida kiriting')
+        with closing(self._db()) as c:
+            c.execute('BEGIN IMMEDIATE')
+            self._advance(c,now,int(duration_s))
+            row=c.execute("SELECT * FROM uzs_queue WHERE uid=? AND status IN ('queued','active','observed')",(uid,)).fetchone()
+            if row:
+                c.execute('COMMIT')
+                return row['id'],False
+            cur=c.execute('INSERT INTO uzs_queue(uid,amount,status,created) VALUES(?,?,"queued",?)',(uid,amount,now))
+            rid=cur.lastrowid
+            self._advance(c,now,int(duration_s))
+            c.execute('COMMIT')
+            return rid,True
+
+    def cancel(self, uid, rid, duration_s, now=None):
+        now=int(time.time()) if now is None else int(now)
+        with closing(self._db()) as c:
+            c.execute('BEGIN IMMEDIATE')
+            change=c.execute('''UPDATE uzs_queue SET status='cancelled'
+                     WHERE uid=? AND id=? AND status IN ('queued','active')''',(uid,rid)).rowcount
+            self._advance(c,now,int(duration_s))
+            c.execute('COMMIT')
+            return bool(change)
+
+    def snapshot(self, rid, now=None):
+        now=int(time.time()) if now is None else int(now)
+        with closing(self._db()) as c:
+            row=c.execute('SELECT * FROM uzs_queue WHERE id=?',(rid,)).fetchone()
+            if not row: return None
+            d=dict(row)
+            if row['status']=='queued':
+                d['position']=1+c.execute('SELECT COUNT(*) FROM uzs_queue '
+                    "WHERE status='queued' AND (created<? OR (created=? AND id<?))",
+                    (row['created'],row['created'],row['id'])).fetchone()[0]
+                active=c.execute("SELECT expires FROM uzs_queue WHERE status='active' LIMIT 1").fetchone()
+                d['active_remaining_s']=max(0,active['expires']-now) if active else 0
+            else:
+                d['position']=0
+                d['active_remaining_s']=max(0,row['expires']-now) if row['status']=='active' else 0
+            return d
+
+    def list_open(self, limit=12):
+        with closing(self._db()) as c:
+            return [dict(r) for r in c.execute('SELECT * FROM uzs_queue '
+                  "WHERE status IN ('active','queued','observed') "
+                  "ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'observed' THEN 1 ELSE 2 END,created,id LIMIT ?",(limit,))]
+
+    def remember_message(self, uid, rid, mid):
+        with closing(self._db()) as c:
+            c.execute('UPDATE uzs_queue SET view_message_id=?,last_view="" WHERE id=? AND uid=?', (mid,rid,uid))
+
+    def remember_view(self,rid,rendered):
+        with closing(self._db()) as c:
+            c.execute('UPDATE uzs_queue SET last_view=? WHERE id=?',(rendered,rid))
+
+    def observe(self, chat_id, message_id, amount, timestamp, last4, expected_last4, now=None):
+        """Mark a single matching event as observed; DO NOT CREDIT a wallet.
+
+        Requires positive UZS amount, expected card suffix, timestamp within
+        active reservation, and a previously unseen (chat_id,message_id).
+        Only moves to 'observed' review state: no automatic settlement.
+        """
+        now=int(time.time()) if now is None else int(now)
+        if not expected_last4 or last4 != expected_last4 or timestamp is None:
+            return None
+        with closing(self._db()) as c:
+            c.execute('BEGIN IMMEDIATE')
+            row=c.execute('''SELECT * FROM uzs_queue WHERE status='active'
+                    AND amount=? AND activated<=? AND expires>=?
+                    AND expires>=? LIMIT 1''',(amount,timestamp,timestamp,now)).fetchone()
+            if not row:
+                c.execute('COMMIT');return None
+            try:
+                c.execute("UPDATE uzs_queue SET status='observed',bank_chat_id=?,bank_message_id=? WHERE id=?",
+                    (chat_id,message_id,row['id']))
+            except sqlite3.IntegrityError:
+                c.execute('ROLLBACK');return None
+            c.execute('COMMIT')
+            return dict(row)
+
+    def review_close(self, rid, duration_s, now=None):
+        now=int(time.time()) if now is None else int(now)
+        with closing(self._db()) as c:
+            c.execute('BEGIN IMMEDIATE')
+            changed=c.execute("UPDATE uzs_queue SET status='reviewed' WHERE id=? AND status='observed'",(rid,)).rowcount
+            self._advance(c,now,int(duration_s))
+            c.execute('COMMIT')
+            return bool(changed)
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("premium-market")
@@ -53,13 +222,14 @@ BOT_USERNAME = ""
 PATH_KEY = hashlib.sha256(TOKEN.encode()).hexdigest()[:48]
 DB_LOCK = threading.RLock()
 STOP = threading.Event()
+UZS_QUEUE = UZSQueue(DB_PATH)
 
 DEFAULTS = {
     "bot_active": "1", "live_delivery": "0", "usd_uzs": "0",
     "xtr_uzs": "0", "gift_cost_per_star_uzs": "378",
     "global_markup_pct": "20", "provider_fee_pct": "1.5",
     "referral_pct": "5", "card_number": "", "card_owner": "",
-    "payment_wait_min": "15", "support_username": "", "min_profit_pct": "0",
+    "payment_wait_min": "5", "support_username": "", "min_profit_pct": "0",
     "bundles_seeded": "0", "prices_reviewed": "0",
 }
 
@@ -206,6 +376,8 @@ def init_db():
 
 
 
+    UZS_QUEUE.init()
+
 def q1(sql, pars=()):
     with db() as c:
         return c.execute(sql, pars).fetchone()
@@ -330,7 +502,7 @@ def main_menu(uid):
     lines = [
         [("⭐ Stars", "catalog_stars"), ("💎 Premium", "catalog_premium")],
         [("🎁 Gifts", "catalog_gifts_0"), ("💰 Hisobim", "profile")],
-        [("💳 To‘lov haqida", "topup")],
+        [("💳 UZS navbati (sinov)", "topup")],
         [("📦 Buyurtmalarim", "my_orders")],
         [("👥 Referal tizimi", "referral")],
         [("🎧 Yordam", "support")],
@@ -669,7 +841,7 @@ def confirm_recipient(uid, username="", rec_uid=None):
     sess["quoted_xtr"] = xtr
     session_set(uid, "checkout", sess)
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("✅ Telegram Stars bilan to‘lash", callback_data="checkout_pay"))
+    kb.add(types.InlineKeyboardButton("🔒 Savdo vaqtincha yopiq", callback_data="checkout_pay"))
     kb.add(copy_btn("📋 Hisoblangan so‘mni nusxalash", str(sale)))
     kb.add(types.InlineKeyboardButton("👥 Qabul qiluvchini o‘zgartirish", callback_data="checkout_change"))
     kb.add(types.InlineKeyboardButton("🏠 Bosh menyu", callback_data="home"))
@@ -681,8 +853,8 @@ def confirm_recipient(uid, username="", rec_uid=None):
               f"💰 Narx: <b>{money(sale)}</b>\n"
               f"🎁 Referal bonus: -{money(discount)}\n"
               f"✅ Qolgan hisob: <b>{money(sale-discount)}</b>\n\n"
-              "📌 Telegram bot ichidagi raqamli mahsulotlar to‘lovi XTR invoice orqali olinadi. "
-              "To‘lov tugmasi ochilganda aniq XTR miqdori ko‘rsatiladi.", kb)
+              "📌 Foydalanuvchi uchun xarid hozircha o‘chiq. Narx ma’lumot uchun ko‘rsatilgan. "
+              "Telegram raqamli mahsulotlar uchun botda XTR checkoutini talab qiladi.", kb)
 
 
 def create_order_from_session(uid):
@@ -781,33 +953,11 @@ def mark_funding_paid(fid, uid, charge, stars):
 
 
 def create_invoice(uid, oid):
-    r = q1("SELECT * FROM orders WHERE id=? AND uid=?", (oid, uid))
-    if not r or r["status"] != "invoice":
-        return send(uid, "Buyurtma topilmadi.")
-    # Validate the recipient before the user can pay. Gift IDs must be known to us.
-    if setting("live_delivery") == "1" and r["kind"] in ("stars", "premium"):
-        try:
-            info = api_call("/getInfo", {"username": valid_username(r["recipient_username"])}, timeout=12)
-            if not info or not info.get("username"):
-                raise ProviderError("Qabul qiluvchi tasdiqlanmadi")
-        except Exception:
-            release_order(oid, "cancelled")
-            raise
-    try:
-        bot.send_invoice(
-            chat_id=uid,
-            title=product_name(r["kind"], r["units"], r["gift_id"])[:32],
-            description=f"Buyurtma #{oid}; qabul qiluvchi: @{r['recipient_username']}" if r["recipient_username"] else f"Buyurtma #{oid}",
-            invoice_payload=f"pm_{oid}", provider_token="", currency="XTR",
-            prices=[types.LabeledPrice("Telegram raqamli mahsuloti", r["payable_xtr"])],
-            start_parameter=f"order{oid}",
-        )
-        send(uid, f"🧾 Buyurtma #{oid}\n💰 So‘mda: {money(r['payable_uzs'])}\n"
-                  f"⭐ Telegram orqali to‘lov: {r['payable_xtr']} XTR\n"
-                  f"⏳ To‘lovni {setting('payment_wait_min')} daqiqa ichida yakunlang.")
-    except Exception:
-        release_order(oid, "cancelled")
-        raise
+    """Buyer invoice intentionally unavailable in this V5 configuration.
+
+    The owner-only `create_funding_invoice` is the only XTR checkout.
+    """
+    raise ValueError('V5: Foydalanuvchi uchun to‘lov o‘chirilgan. Raqamli tovarlar uchun UZS karta checkoutiga Telegram ruxsat bermaydi.')
 
 
 def mark_paid(oid, uid, charge, amount):
@@ -921,7 +1071,7 @@ def profile(uid):
     send(uid, f"👤 <b>Hisobim</b>\n🆔 {uid}\n📱 @{esc(r['username'] or 'username yo‘q')}\n"
               f"💰 Referal bonus hisobingiz: {money(r['bonus_uzs'])}\n"
               f"✅ Bajarilgan buyurtmalar: {completed}\n👥 Takliflar: {invites}\n\n"
-              "Referal bonusni keyingi xaridda ishlatishingiz mumkin." +
+              "Referal bonusni keyingi xaridda ishlatish savdo yoqilgach mumkin bo‘ladi." +
               (f"\nℹ️ Eski XTR bonusi: {r['bonus_xtr']} (v1, avtomatik almashtirilmagan)" if r['bonus_xtr'] else ""),
          rows([("👥 Referal", "referral"), ("📦 Buyurtmalar", "my_orders")], [("🏠 Bosh menyu", "home")]))
 
@@ -950,7 +1100,7 @@ def referral(uid):
     send(uid, f"👥 <b>Referal tizimi</b>\n\n🔗 {esc(link)}\n"
               f"👥 Do‘stlar: {invites}\n💰 Bonus hisobingiz: {money(bonus)}\n"
               f"📈 Do‘stingiz mahsulot sotib olsa, xarid qiymatining {setting('referral_pct')}% qismi hisobingizga tushadi.\n\n"
-              "Bu bonusni keyingi Stars, Premium yoki Gift xaridingizda ishlatasiz. "
+              "Savdo qayta yoqilsa, bonusni keyingi xarid uchun ishlatishingiz mumkin. "
               "Bonus faqat muvaffaqiyatli yetkazilgan buyurtma uchun beriladi.", kb)
 
 
@@ -969,7 +1119,7 @@ def admin_menu(uid):
         return
     paid = q1("SELECT COUNT(*) AS c,COALESCE(SUM(price_uzs),0) AS s FROM orders WHERE status='done'")
     users = q1("SELECT COUNT(*) AS c FROM users")["c"]
-    send(uid, f"⚙️ <b>ADMIN PANEL — V3</b>\n👥 Foydalanuvchilar: {users}\n"
+    send(uid, f"⚙️ <b>ADMIN PANEL — V5</b>\n👥 Foydalanuvchilar: {users}\n"
               f"✅ Sotilgan: {paid['c']} ta\n💰 Savdo qiymati: {money(paid['s'])}\n"
               f"📦 Holat: {'🟢 Faol' if setting('live_delivery')=='1' else '🔴 Sinov'}",
          rows([("⭐ Stars paketlari", "admin_bundles_stars"), ("💎 Premium", "admin_bundles_premium")],
@@ -978,6 +1128,7 @@ def admin_menu(uid):
               [("👥 Referal", "admin_ref"), ("📦 Buyurtmalar", "admin_orders")],
               [("👮 Adminlar", "admin_users"), ("📢 Majburiy kanallar", "admin_channels")],
               [("📣 Xabar yuborish", "admin_broadcast"), ("💳 HUMO monitoring", "admin_humo")],
+              [("⏳ To‘lov navbati (sinov)", "admin_queue")],
               [("🌐 API/Balans", "admin_api"), ("⚙️ Sozlamalar", "admin_settings")],
               [("✅ Narxlarni tekshirdim", "review_prices")],
               [("🔴/🟢 Savdoni yoqish", "toggle_live")],
@@ -1367,17 +1518,114 @@ def broadcast_worker():
 # HUMO banking notifications are NOT an authenticated merchant payment webhook.
 # We record incoming events once, but NEVER credit a wallet from notifications alone.
 # Receipt example: 🎉 To'ldirish / ➕ 5.000,00 UZS / 💳 HUMOCARD *1382
+def queue_duration_s():
+    return max(5,min(60,int(setting("payment_wait_min"))))*60
+
+
+def queue_text(r):
+    wait_mins=int(setting('payment_wait_min'))
+    if r['status']=='queued':
+        est=r['active_remaining_s']+(max(0,r['position']-1)*wait_mins*60)
+        return (f"⏳ <b>Navbat kutilyapti (SINOV)</b>\n"
+            f"🧾 So‘rov: #{r['id']}\n💰 Summa: {money(r['amount'])}\n"
+            f"👥 Navbatdagi o‘rningiz: <b>{r['position']}</b>\n"
+            f"⌛ Taxminiy boshlanish: {est//60:02d}:{est%60:02d}\n\n"
+            "Karta raqami faqat navbatingiz kelganda ko‘rsatiladi.\n"
+            "⚠️ SINOV. Haqiqiy pul yubormang: bankning rasmiy avtomatik tasdig‘i ulanmagan.")
+    if r['status']=='active':
+        rem=r['active_remaining_s']
+        return (f"💳 <b>Navbatingiz keldi (SINOV)</b>\n"
+            f"🧾 So‘rov: #{r['id']}\n👤 Karta egasi: {esc(setting('card_owner'))}\n"
+            f"💳 Karta: <code>{esc(setting('card_number'))}</code>\n"
+            f"💰 Belgilangan summa: <code>{r['amount']}</code> so‘m\n"
+            f"⏳ Qolgan vaqt: <b>{rem//60:02d}:{rem%60:02d}</b>\n\n"
+            "⚠️ SINOV. Haqiqiy pul yubormang. HUMO xabari bankning tasdiqlangan merchant to‘lovi emas.")
+    if r['status']=='observed':
+        return (f"🔎 <b>HUMO bildirishnomasi kuzatildi</b>\n"
+                f"🧾 #{r['id']} — {money(r['amount'])}\n"
+                "Bu rasmiy tasdiq EMAS. Hisobga mablag‘ qo‘shilmadi. "
+                "Admin hodisani tekshirmaguncha keyingi navbat boshlanmaydi.")
+    return f"🧾 #{r['id']} — {r['status']}\n💰 {money(r['amount'])}\nYangi so‘rovni boshlashingiz mumkin."
+
+
+def queue_markup(r):
+    k=types.InlineKeyboardMarkup(row_width=1)
+    if r['status']=='active':
+        k.add(copy_btn('📋 Karta raqamini nusxalash',setting('card_number')))
+        k.add(copy_btn('💰 Summani nusxalash',str(r['amount'])))
+    k.add(types.InlineKeyboardButton('🔄 Holatni yangilash',callback_data=f'queue_status_{r["id"]}'))
+    if r['status'] in ('active','queued'):
+        k.add(types.InlineKeyboardButton('❌ Navbatdan chiqish',callback_data=f'queue_cancel_{r["id"]}'))
+    k.add(types.InlineKeyboardButton('🏠 Bosh menyu',callback_data='home'))
+    return k
+
+
+def queue_show(uid,rid,refresh=False):
+    UZS_QUEUE.advance(queue_duration_s())
+    r=UZS_QUEUE.snapshot(rid)
+    if not r or r['uid']!=uid:
+        return send(uid,'❌ So‘rov topilmadi.')
+    txt=queue_text(r)
+    if refresh and r['view_message_id']:
+        try:
+            bot.edit_message_text(txt, uid, r['view_message_id'],
+                                  reply_markup=queue_markup(r),parse_mode='HTML')
+            UZS_QUEUE.remember_view(rid,txt)
+            return
+        except Exception as e:
+            if 'message is not modified' in str(e).lower():return
+    m=send(uid,txt,queue_markup(r))
+    UZS_QUEUE.remember_message(uid,rid,m.message_id)
+    UZS_QUEUE.remember_view(rid,txt)
+
+
+def queue_join(uid,amount):
+    if not setting('card_number') or not setting('card_owner'):
+        return send(uid,'⚠️ Admin sinov uchun karta va karta egasini sozlamagan.')
+    rid,new=UZS_QUEUE.join(uid,amount,queue_duration_s())
+    if not new:
+        send(uid,f'ℹ️ Sizda #{rid} so‘rovi bor. Yangi so‘rov ochish uchun eskisini yakunlang.')
+    queue_show(uid,rid)
+
+
+def queue_worker():
+    while not STOP.is_set():
+        try:
+            fresh=UZS_QUEUE.advance(queue_duration_s())
+            if fresh:
+                r=UZS_QUEUE.snapshot(fresh)
+                if r:
+                    try: queue_show(r['uid'],fresh,refresh=True)
+                    except Exception: log.exception('Queue arrival notify failed')
+            # Update the first 10 queued views every ~15 seconds, avoiding flood.
+            for r in UZS_QUEUE.list_open(10):
+                snap=UZS_QUEUE.snapshot(r['id'])
+                if not snap or not snap['view_message_id']:continue
+                txt=queue_text(snap)
+                if txt==snap['last_view']:continue
+                try:
+                    bot.edit_message_text(txt,snap['uid'],snap['view_message_id'],
+                            reply_markup=queue_markup(snap),parse_mode='HTML')
+                    UZS_QUEUE.remember_view(r['id'],txt)
+                except Exception as e:
+                    if 'message is not modified' not in str(e).lower():
+                        log.info('Queue display update skipped for #%s: %s',r['id'],str(e)[:120])
+        except Exception:
+            log.exception('Queue tick error')
+        STOP.wait(15)
+
+
 def topup_menu(uid):
-    """Explain checkout method without collecting impermissible card transfers."""
-    send(uid, "💳 <b>TO‘LOV HAQIDA</b>\n\n"
-              "⭐ Stars, 💎 Premium va 🎁 Gift raqamli mahsulotlar uchun "
-              "Telegram ichidagi to‘lov <b>XTR</b> orqali qilinadi.\n"
-              "💰 Mahsulot narxi katalogda so‘mda ko‘rsatiladi, xarid "
-              "paytida to‘lanadigan XTR soni alohida chiqadi.\n\n"
-              "Bank kartasiga UZS o‘tkazish orqali raqamli mahsulot sotish "
-              "bu botda yoqilmagan.",
-         rows([("⭐ Stars", "catalog_stars"), ("💎 Premium", "catalog_premium")],
-              [("🎁 Gifts", "catalog_gifts_0")], [("🏠 Bosh menyu", "home")]))
+    send(uid,'💳 <b>UZS navbat tizimi — faqat SINOV</b>\n\n'
+         f'Bir vaqtda 1 ta so‘rov. Har biriga {setting("payment_wait_min")} daqiqa.\n'
+         '⏳ Kutayotgan odam navbat raqami va qolgan vaqtni ko‘radi.\n'
+         '💳 Karta faqat navbat kelganda ko‘rinadi.\n\n'
+         '⚠️ Bu xizmattan haqiqiy pul yig‘ish uchun foydalanmang. '
+         'Telegram raqamli mahsulotlari faqat XTR to‘lovi bilan sotiladi. '
+         'HUMO xabari hech qachon avtomatik balansga yozilmaydi.',
+         rows([('💰 200 so‘m (sinov)','queue_amount_200'),('💰 5 000 so‘m (sinov)','queue_amount_5000')],
+              [('💰 20 000 so‘m (sinov)','queue_amount_20000')],
+              [('✏️ Boshqa summa','queue_custom')],[('🔙 Orqaga','home')]))
 
 
 def create_humo_test_request(uid, amount):
@@ -1470,7 +1718,7 @@ def store_humo_event(chat_id, message_id, text):
     if not data:return False
     amount,card=data
     # Guard against misattributed card/other unknown cards; set an explicit last4.
-    wanted=os.getenv("HUMO_CARD_LAST4", "").strip()
+    wanted=(os.getenv("HUMO_CARD_LAST4", "").strip() or setting("card_number")[-4:])
     status="audit_only" if wanted and wanted==card else "unverified_card"
     with DB_LOCK,db() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -1490,6 +1738,13 @@ def store_humo_event(chat_id, message_id, text):
                 matched_req=(req['id'],req['uid'])
         c.execute("COMMIT")
     if cur.rowcount:
+        if status=='audit_only':
+            observed=UZS_QUEUE.observe(chat_id,message_id,amount,bank_ts,card,wanted)
+            if observed:
+                notice_owner(f"🔎 Navbatli SINOV #{observed['id']}: HUMO xabari mos tushdi. "
+                             "Balansga pul tushgani tasdiqlanmagan, so‘rov admin tekshiruvini kutadi.")
+                try:queue_show(observed['uid'],observed['id'],refresh=True)
+                except Exception:log.exception('Queue observed notification failed')
         notice_owner(f"💳 HUMO kirim kuzatildi: {money(amount)}, *{card}. "
                      + (f"Sinov so‘rov #{matched_req[0]} bilan mos. " if matched_req else "Mos kelgan so‘rov yo‘q. ")
                      + "Bu rasmiy to‘lov tasdig‘i emas; balansga pul qo‘shilmadi.")
@@ -1506,7 +1761,7 @@ def admin_humo(uid):
     rs=qall("SELECT amount_uzs,card_last4,status,received_ts FROM humo_events ORDER BY received_ts DESC LIMIT 10")
     lines=["💳 <b>HUMO MONITORING</b>","⚠️ Xabar — bankning tasdiqlangan to‘lov webhooki emas.",
            "🔐 Telethon: "+("sozlangan" if os.getenv('TELETHON_STRING_SESSION') else "ulanmagan"),
-           "💳 Karta oxiri: "+(os.getenv('HUMO_CARD_LAST4') or 'ko‘rsatilmagan'),""]
+           "💳 Karta oxiri: "+(os.getenv('HUMO_CARD_LAST4') or setting("card_number")[-4:] or 'ko‘rsatilmagan'),""]
     for r in rs:lines.append(f"• {money(r['amount_uzs'])}, *{r['card_last4']}, {r['status']}")
     reqs=qall("SELECT * FROM humo_requests ORDER BY id DESC LIMIT 5")
     lines.append("\n🧪 UZS sinov so‘rovlari:")
@@ -1687,6 +1942,12 @@ def on_success(m):
         notice_owner(f"⚠️ Kutilmagan payment: user={uid}. Tekshirilsin.")
         return
     oid = int(match.group(1))
+    # Old V4 invoices sometimes arrive after a V5 deployment. Never fulfill them:
+    # mark pending order cancelled, then deduplicated receipt handler queues refund.
+    with DB_LOCK, db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE orders SET status='cancelled' WHERE id=? AND status='invoice'",(oid,))
+        conn.execute("COMMIT")
     result = record_verified_receipt(oid, uid, sp.telegram_payment_charge_id, int(sp.total_amount))
     if result == "duplicate":
         return
@@ -1702,22 +1963,15 @@ def on_success(m):
 
 @bot.pre_checkout_query_handler(func=lambda q: True)
 def on_pre_checkout(q):
+    """Only owner can pay XTR to fund their own bot (gift purchases)."""
     fund = re.fullmatch(r"fund_(\d+)", q.invoice_payload or "")
+    ok = False
     if fund and q.currency == "XTR":
         f = q1("SELECT * FROM admin_funding WHERE id=?", (int(fund.group(1)),))
-        ok = bool(f and f["owner_id"] == OWNER_ID == q.from_user.id and
-                  f["status"] == "invoice" and f["stars"] == q.total_amount)
-        return bot.answer_pre_checkout_query(q.id,ok=ok,
-                       error_message=None if ok else "Invoice eskirgan yoki noto‘g‘ri")
-    match = re.fullmatch(r"pm_(\d+)", q.invoice_payload or "")
-    ok = False
-    if match and q.currency == "XTR" and setting("live_delivery") == "1":
-        r = q1("SELECT uid,payable_xtr,status,created FROM orders WHERE id=?", (int(match.group(1)),))
-        ok = (r is not None and r["uid"] == q.from_user.id and r["status"] == "invoice"
-              and r["payable_xtr"] == q.total_amount
-              and time.time() < r["created"] + 60*int(setting("payment_wait_min")))
-    bot.answer_pre_checkout_query(q.id, ok=bool(ok),
-                                  error_message=None if ok else "Buyurtma muddati tugagan yoki sotuv o‘chirilgan. Yangi buyurtma yarating.")
+        ok = bool(f and f["owner_id"] == OWNER_ID == q.from_user.id
+                  and f["status"] == "invoice" and f["stars"] == q.total_amount)
+    return bot.answer_pre_checkout_query(q.id, ok=ok,
+        error_message=None if ok else "Bu invoice yopilgan. Faqat admin Stars to‘ldirishi mumkin.")
 
 
 @bot.message_handler(content_types=["text"])
@@ -1753,6 +2007,14 @@ def on_text(m):
         return
     if not show_subscriptions(uid):
         return
+    if step == 'queue_input':
+        try:
+            amt=int(re.sub(r'\s+','',text))
+            queue_join(uid,amt)
+            session_clear(uid)
+            return
+        except Exception as e:
+            return send(uid,'❌ '+esc(e)+'\nQayta summa yuboring yoki /cancel.')
     if step == "topup_input":
         try:
             amt=int(re.sub(r"\s+","",text))
@@ -1852,6 +2114,25 @@ def on_callback(c):
             jid=int(data.rsplit("_",1)[1])
             change("UPDATE broadcasts SET status='cancelled' WHERE id=? AND sender_uid=? AND status IN ('draft','sending')",(jid,uid))
             return broadcast_panel(uid)
+        if data == 'admin_queue' and is_admin(uid):
+            rs=UZS_QUEUE.list_open(20)
+            lines=['⏳ <b>UZS NAVBAT — SINOV</b>',
+                'Faqat xabarlarni kuzatadi, haqiqiy balansga pul qo‘shmaydi.',
+                f'Kutish vaqti: {setting("payment_wait_min")} daqiqa', '']
+            for x in rs:
+                lines.append(f"#{x['id']} • {x['uid']} • {money(x['amount'])} • {x['status']}")
+            k=rows([('⏱ Kutish vaqtini o‘zgartirish','edit_setting_payment_wait_min')],
+                   [('🔄 Yangilash','admin_queue')],[('🔙 Admin','admin')])
+            for x in rs:
+                if x['status']=='observed':
+                    k.add(types.InlineKeyboardButton(f"✅ Kuzatuvni yopish #{x['id']}",
+                         callback_data=f"queue_review_{x['id']}"))
+            return send(uid,'\n'.join(lines),k)
+        if data.startswith('queue_review_') and uid==OWNER_ID:
+            rid=int(data.rsplit('_',1)[1])
+            if UZS_QUEUE.review_close(rid,queue_duration_s()):
+                notice_owner(f"Sinov so‘rov #{rid} ko‘rib chiqildi; mablag‘ balansga qo‘shilmadi.")
+            return send(uid,'✅ Sinov hodisasi yopildi.',rows([('⏳ Navbat','admin_queue')]))
         if data == "admin_humo" and is_admin(uid):
             return admin_humo(uid)
         if data == "home":
@@ -1906,15 +2187,28 @@ def on_callback(c):
             return send(uid, "🎯 Kimga yuborilsin?",
                         rows([("👤 O‘zimga", "who_self"), ("👥 Do‘stimga", "who_friend")]))
         if data == "checkout_pay":
-            try:
-                oid = create_order_from_session(uid)
-                return create_invoice(uid, oid)
-            except Exception as e:
-                return send(uid, "⚠️ Buyurtma yaratilmadi: " + esc(e))
+            return send(uid, '⚠️ <b>Haqiqiy xarid hozir o‘chiq.</b>\n\n'
+                'Siz foydalanuvchi uchun XTR to‘lovini o‘chirishni so‘radingiz. '
+                'Telegram Stars/Premium/Gift raqamli mahsulotlari bot ichida faqat XTR orqali sotiladi. '
+                'Bank kartasi orqali bu xaridni avtomatik tasdiqlashga ruxsat yo‘q. '
+                'Adminning bot Stars balansini to‘ldirish invoice’i mustaqil ishlaydi.',
+                rows([('🏠 Bosh menyu','home')]))
         if data == "profile":
             return profile(uid)
         if data == "topup":
             return topup_menu(uid)
+        if data=='queue_custom':
+            session_set(uid,'queue_input')
+            return send(uid,'💰 So‘rov summasini kiriting (200–50 000 000 so‘m).\n'
+                        '⚠️ Bu faqat navbat SINOVI. Pul yubormang.\nBekor: /cancel')
+        if data.startswith('queue_amount_'):
+            return queue_join(uid,int(data.rsplit('_',1)[1]))
+        if data.startswith('queue_status_'):
+            return queue_show(uid,int(data.rsplit('_',1)[1]),refresh=True)
+        if data.startswith('queue_cancel_'):
+            rid=int(data.rsplit('_',1)[1])
+            done=UZS_QUEUE.cancel(uid,rid,queue_duration_s())
+            return queue_show(uid,rid,refresh=True) if done else send(uid,'Bu so‘rovni bekor qilib bo‘lmaydi.')
         if data == "topup_custom":
             if uid != OWNER_ID:
                 return topup_menu(uid)
@@ -2059,6 +2353,9 @@ def on_callback(c):
             set_setting("prices_reviewed", "1")
             return admin_menu(uid)
         if data == "toggle_live":
+            return send(uid,'⚠️ Foydalanuvchi mahsulotlarini sotish vaqtincha o‘chirilgan: '
+                'siz XTR checkoutni istamadingiz, UZS karta checkout esa Telegram raqamli tovarlar uchun mos emas. '
+                'Bu versiyada faqat adminning Stars balansini to‘ldirishi faol.')
             if setting("live_delivery") == "0":
                 if setting("prices_reviewed") != "1":
                     return send(uid, "⚠️ Avval barcha mahsulot narxlarini haqiqiy tannarx bilan "
@@ -2117,7 +2414,7 @@ def health():
         ok = True
     except Exception:
         ok = False
-    return jsonify(ok=ok, service="Premium Market V4", webhook_mode=bool(PUBLIC_URL),
+    return jsonify(ok=ok, service="Premium Market V5", webhook_mode=bool(PUBLIC_URL),
                    database_ready=ok, fragment_configured=bool(FRAGMENT_KEY),
                    sales_enabled=ok and setting("live_delivery") == "1"), (200 if ok else 503)
 
@@ -2176,9 +2473,11 @@ def startup():
     if PUBLIC_URL and not WEBHOOK_SECRET:
         raise RuntimeError("WEBHOOK_SECRET is required when PUBLIC_URL/RENDER_EXTERNAL_URL is set")
     init_db()
+    set_setting("live_delivery","0")  # V5 explicitly disables user product checkout
     startup.started = True
     threading.Thread(target=order_worker, name="order-worker", daemon=True).start()
     threading.Thread(target=broadcast_worker, name="broadcast-worker", daemon=True).start()
+    threading.Thread(target=queue_worker, name="uzs-queue-worker", daemon=True).start()
     start_humo_listener()
     threading.Thread(target=gift_refresh_worker, name="gift-refresh", daemon=True).start()
     threading.Thread(target=_webhook_maintainer, name="webhook-setup", daemon=True).start()
