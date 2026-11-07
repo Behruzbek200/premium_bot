@@ -1,7 +1,0 @@
-pyTelegramBotAPI>=4.34,<5
-Flask>=3.0,<4
-requests>=2.31,<3
-python-dotenv>=1.0,<2
-Telethon>=1.40,<2
-gunicorn>=22,<25
-psycopg2-binary>=2.9.9,<3
