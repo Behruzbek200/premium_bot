@@ -1,0 +1,11 @@
+# Do not commit credentials, sessions or local databases
+.env
+.env.*
+!.env.example
+*session*.txt
+*.session
+*.sqlite3
+*.sqlite
+*.db
+__pycache__/
+*.pyc
