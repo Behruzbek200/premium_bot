@@ -217,6 +217,11 @@ class PGConnection:
         return self.cur.fetchone() if self.cur is not None else None
     def fetchall(self):
         return self.cur.fetchall() if self.cur is not None else []
+    def __iter__(self):
+        """Match sqlite3.Cursor iteration: c.execute(SELECT ...) is iterable."""
+        if self.cur is None:
+            return iter(())
+        return iter(self.cur)
     def commit(self):self.conn.commit()
     def rollback(self):self.conn.rollback()
     def close(self):
@@ -644,7 +649,7 @@ def stars_menu(uid):
     price=param('star_price')
     if price<=0:
         safe_send(uid,'⭐ Stars narxlari hali administrator tomonidan belgilanmagan.');return
-    with db() as c: packs=[r['amount'] for r in c.execute('SELECT amount FROM packages WHERE enabled=1 ORDER BY amount')]
+    with db() as c: packs=[r['amount'] for r in c.execute('SELECT amount FROM packages WHERE enabled=1 ORDER BY amount').fetchall()]
     rows=[]
     for i in range(0,len(packs),2):
         rows.append([(f'⭐ {x:,} — {money(stars_total(x, price))}',f's:pack:{x}') for x in packs[i:i+2]])
@@ -2005,7 +2010,7 @@ def send_broadcast(m):
     uid=m.from_user.id
     if not is_admin(uid):return
     clear_state(uid)
-    with db() as c: ids=[r['id'] for r in c.execute('SELECT id FROM users WHERE banned=0')]
+    with db() as c: ids=[r['id'] for r in c.execute('SELECT id FROM users WHERE banned=0').fetchall()]
     job_id='B'+uuid.uuid4().hex[:14].upper()
     with db(True) as c:
         c.executemany('INSERT INTO broadcast_queue(job_id,from_chat,source_message,target_id,status,created) VALUES(?,?,?,?,?,?)',
