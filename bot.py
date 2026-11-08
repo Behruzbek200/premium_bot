@@ -92,6 +92,11 @@ _CHAT_PROCESS_LOCKS = [threading.Lock() for _ in range(256)]
 # Tashqi Fragment so'rovi HTTP request threadini to'smaydi.
 _PURCHASE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='fragment-purchase')
 _PURCHASE_CAPACITY = threading.BoundedSemaphore(8)
+_RECIPIENT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='recipient-check')
+_PROOF_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='proof-post')
+_CATALOG_CACHE = {}
+_CATALOG_CACHE_LOCK = threading.Lock()
+
 
 # Qisqa muddatli sozlamalar keshi, global/maxfiy sirlarni log qilmaymiz.
 _SETTING_CACHE = {}
@@ -296,6 +301,8 @@ def setup_db():
           card_holder TEXT NOT NULL DEFAULT '', expires_at INTEGER,
           status TEXT NOT NULL, created TEXT NOT NULL, updated TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS ix_pay_user ON payments(user_id,created);
+        CREATE TABLE IF NOT EXISTS proof_posts (
+          order_id TEXT PRIMARY KEY, status TEXT NOT NULL, created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS bank_events (
           sender_id BIGINT NOT NULL, message_id BIGINT NOT NULL,
           tx_ref TEXT NOT NULL UNIQUE, amount BIGINT NOT NULL,
@@ -345,6 +352,7 @@ def setup_db():
           'public_url':'', 'payment_enabled':'1',
           'fragment_key': '', 'referral_percent': '5', 'referral_enabled': '1',
           'payment_card_number': '', 'payment_card_name': '',
+          'proof_channel': '',
           'telegram_webhook_path': secrets.token_urlsafe(26),
           'telegram_header_secret': secrets.token_urlsafe(32),
           'payment_monitor_token': secrets.token_urlsafe(30)
@@ -370,6 +378,8 @@ def setup_db():
             usercols={x[1] for x in c.execute('PRAGMA table_info(users)').fetchall()}
         if 'referral_balance' not in usercols:
             c.execute('ALTER TABLE users ADD COLUMN referral_balance INTEGER NOT NULL DEFAULT 0')
+        if 'proof_opt_in' not in usercols:
+            c.execute('ALTER TABLE users ADD COLUMN proof_opt_in INTEGER NOT NULL DEFAULT 0')
         names=[('🌹','Atirgul'),('🧸','Ayiqcha'),('💝','Yurakcha'),('🌸','Gul'),
                ('🎂','Tort'),('⭐','Yulduz'),('💍','Uzuk'),('🏆','Kubok'),
                ('🚀','Raketa'),('🎈','Sharlar'),('🎁','Sovg‘a')]
@@ -580,7 +590,7 @@ def menu_kb(admin=False):
     if admin:
         buttons=[('⭐ Stars narxlari','💎 Premium narxlari'),('🎁 Gift boshqaruvi','👥 Referal sozlamalari'),('⭐ Bot Stars balansi','📦 Buyurtmalar'),('👥 Foydalanuvchilar',),
                  ('📊 Statistika','💳 To‘lovlar'),('🔌 API va to‘lov','📢 Xabar yuborish'),
-                 ('📣 Majburiy obuna','👑 Adminlar'),('🎧 Murojaatlar','⚙️ Sozlamalar'),('🏠 User menyu',)]
+                 ('📣 Majburiy obuna','👑 Adminlar'),('🎧 Murojaatlar','⚙️ Sozlamalar'),('📣 Isbotlar kanali',),('🏠 User menyu',)]
     else:
         buttons=[('⭐ Stars olish','💎 Premium olish'),('🎁 Gift olish','👥 Referal'),('💳 Hisob to‘ldirish','💰 Hisobim'),
                  ('📦 Buyurtmalarim','🎧 Yordam')]
@@ -649,7 +659,15 @@ def stars_menu(uid):
     price=param('star_price')
     if price<=0:
         safe_send(uid,'⭐ Stars narxlari hali administrator tomonidan belgilanmagan.');return
-    with db() as c: packs=[r['amount'] for r in c.execute('SELECT amount FROM packages WHERE enabled=1 ORDER BY amount').fetchall()]
+    with _CATALOG_CACHE_LOCK:
+        existing=_CATALOG_CACHE.get('packages')
+    if existing and existing[0]>time.monotonic():
+        packs=existing[1]
+    else:
+        with db() as c:
+            packs=[r['amount'] for r in c.execute('SELECT amount FROM packages WHERE enabled=1 ORDER BY amount').fetchall()]
+        with _CATALOG_CACHE_LOCK:
+            _CATALOG_CACHE['packages']=(time.monotonic()+20.0,packs)
     rows=[]
     for i in range(0,len(packs),2):
         rows.append([(f'⭐ {x:,} — {money(stars_total(x, price))}',f's:pack:{x}') for x in packs[i:i+2]])
@@ -694,27 +712,55 @@ def extract_username(s):
 
 def preview_recipient(uid, username):
     step,data=state(uid)
-    if step!='enter_recipient':return
-    api_key=read_secret('fragment_key')
-    if not api_key:
-        safe_send(uid,'❌ Fragment API kaliti sozlanmagan.');clear_state(uid);return
-    safe_send(uid,'🔎 Telegram foydalanuvchisi tekshirilmoqda...')
+    if step!='enter_recipient':return safe_send(uid,'Qabul qiluvchini qayta tanlang.')
+    if not read_secret('fragment_key'):
+        clear_state(uid)
+        return safe_send(uid,'❌ Xaridni tekshirish uchun API sozlanmagan.')
+    payload=dict(data)
+    payload['candidate']=username
+    set_state(uid,'checking_recipient',payload)
+    reply=safe_send(uid,'🔎 Qabul qiluvchi tekshirilmoqda...')
+    _RECIPIENT_POOL.submit(_recipient_lookup_worker,uid,username,payload)
+    return reply
+
+
+def _recipient_lookup_worker(uid,username,payload):
     try:
         j=fragment('/getInfo',{'username':username})
-        if j.get('ok') is not True: raise ValueError(str(j.get('message') or 'Profil topilmadi'))
-        profile=j.get('result') or {}
-        resolved=extract_username(str(profile.get('username') or username))
-        if resolved.lower()!=username.lower(): raise ValueError('Qabul qiluvchi username mos kelmadi')
-    except Exception as e:
-        safe_send(uid,'❌ Qabul qiluvchi tekshirilmadi: '+esc(str(e))[:300]+'\nUsername yoki havolani qayta yuboring.');return
-    data['recipient']=username
-    set_state(uid,'review_order',data)
-    r=user_row(uid)
-    title=f"⭐ {data['qty']} Stars" if data['kind']=='stars' else f"💎 {data['qty']} oylik Premium"
-    safe_send(uid,f'🧾 <b>Buyurtmani tekshiring</b>\n\n📦 {title}\n👤 Qabul qiluvchi: @{esc(username)}'
-             f"\n💰 Narx: <b>{money(data['total'])}</b>\n💳 Balans: {money(r['balance'] if r else 0)}"
-             '\n\n✅ Tasdiqlasangiz balansingizdan pul yechilib, buyurtma avtomatik yuboriladi.',
-             keyboard([[('✅ Tasdiqlash','buy:confirm')],[('💳 Hisob to‘ldirish','top:menu'),('❌ Bekor','home')]]))
+        if j.get('ok') is not True:
+            raise ValueError(str(j.get('message') or 'Profil topilmadi'))
+        found=j.get('result') or {}
+        resolved=extract_username(str(found.get('username') or username))
+        if resolved.lower()!=username.lower():
+            raise ValueError('Qabul qiluvchi username mos kelmadi')
+        with db(True) as c:
+            st=c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
+            if not st or st['step']!='checking_recipient' or json.loads(st['data'])!=payload:
+                return
+            order_data={k:v for k,v in payload.items() if k!='candidate'}
+            order_data['recipient']=username
+            c.execute('UPDATE states SET step=?,data=? WHERE user_id=?',
+                      ('review_order',json.dumps(order_data,ensure_ascii=False),uid))
+        r=user_row(uid)
+        title=f"⭐ {payload['qty']} Stars" if payload['kind']=='stars' else f"💎 {payload['qty']} oylik Premium"
+        safe_send(uid,f'🧾 <b>Buyurtmani tekshiring</b>\n\n📦 {title}\n'
+                 f'👤 Qabul qiluvchi: @{esc(username)}\n'
+                 f'💰 Narx: <b>{money(payload["total"])}</b>\n'
+                 f'💳 Balansingiz: <b>{money(r["balance"] if r else 0)}</b>\n\n'
+                 '✅ Tasdiqlasangiz, buyurtma avtomatik yetkaziladi.',
+                 keyboard([[('✅ Tasdiqlash','buy:confirm')],
+                           [('💳 Hisob to‘ldirish','top:menu'),('❌ Bekor qilish','home')]]))
+    except Exception as exc:
+        logger.warning('Qabul qiluvchi tekshirish ishlamadi user=%s type=%s',uid,type(exc).__name__)
+        should_notify=False
+        with db(True) as c:
+            st=c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
+            if st and st['step']=='checking_recipient' and json.loads(st['data'])==payload:
+                c.execute('UPDATE states SET step=?,data=? WHERE user_id=?',
+                          ('enter_recipient',json.dumps({k:v for k,v in payload.items() if k!='candidate'},ensure_ascii=False),uid))
+                should_notify=True
+        if should_notify:
+            safe_send(uid,'❌ Qabul qiluvchi topilmadi yoki tekshirilmadi. @username ni tekshirib qayta yuboring.')
 
 
 def fragment(path,payload):
@@ -787,7 +833,7 @@ def finish_order(oid, status, reason=''):
     reward=None
     with db(True, financial=True) as c:
         o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
-        if not o or o['status'] not in ('processing','review'):
+        if not o or o['status'] not in ('processing','review','waiting_funds'):
             return None
         if status=='refunded':
             # Aynan bir marta refund, ledger reference UNIQUE.
@@ -857,14 +903,31 @@ def process_purchase(oid):
         payload['amount' if o['kind']=='stars' else 'duration']=o['qty']
         j=fragment(path,payload)  # ATAYLAB hech qachon avtomatik retry qilinmaydi.
         if j.get('ok') is True:
-            finish_order(oid,'completed',str(j.get('result',{}))[:450])
-            safe_send(o['user_id'],f'✅ <b>Buyurtma bajarildi!</b>\n🧾 {esc(oid)}\n👤 @{esc(o["recipient"])}')
-            notify_admin(f'✅ Buyurtma bajarildi: {oid} | {o["kind"]} {o["qty"]}')
+            done=finish_order(oid,'completed',str(j.get('result',{}))[:450])
+            if done:
+                safe_send(o['user_id'],delivery_text(o))
+                publish_proof(o)
+                notify_admin(f'✅ Buyurtma bajarildi: {oid} | {o["kind"]} {o["qty"]}')
             return
-        code=str(j.get('code',''))
+        code=str(j.get('code','')).strip().upper()
         reason=str(j.get('message','API xatosi'))[:220]
         # faqat provayderning aniq deterministik xatolari auto-refund
-        safe_codes={'INSUFFICIENT_FUNDS','INSUFFICIENT_GAS','INVALID_AMOUNT_MIN','INVALID_AMOUNT_MAX','INVALID_DURATION','IP_NOT_ALLOWED'}
+        # Provider explicitly reports insufficient wallet funds/gas: the
+        # order is NOT re-sent automatically. Money is held for manual review.
+        if code in {'INSUFFICIENT_FUNDS','INSUFFICIENT_GAS','INSUFFICIENT_BALANCE',
+                    'NOT_ENOUGH_FUNDS','NOT_ENOUGH_BALANCE','LOW_BALANCE'}:
+            finish_order(oid,'waiting_funds',code+': '+reason)
+            safe_send(o['user_id'],
+                      '⏳ <b>Buyurtmangiz yetkazilishi kutilmoqda.</b>\n\n'
+                      'Yetkazib beruvchi hisobida vaqtincha mablag‘ yetarli emas. '
+                      'Pulingiz buyurtma uchun saqlangan. Iltimos, administratorga murojaat qiling.\n'
+                      '⚠️ Shu buyurtmani qayta sotib olmang.')
+            notify_admin(f'🚨 FRAGMENT BALANSI YETARLI EMAS\nBuyurtma: {oid}\n'
+                         f'Xaridor: <code>{o["user_id"]}</code>\n'
+                         'Hamyonni to‘ldirib, yetkazilganini Fragmentda tekshirgach '
+                         'admin paneldan buyurtmani hal qiling.')
+            return
+        safe_codes={'INVALID_AMOUNT_MIN','INVALID_AMOUNT_MAX','INVALID_DURATION','IP_NOT_ALLOWED'}
         if code in safe_codes:
             finish_order(oid,'refunded',code+': '+reason)
             safe_send(o['user_id'],f'❌ Buyurtma bajarilmadi. Pul balansga qaytarildi.\n🧾 {esc(oid)}\nSabab: {esc(reason)}')
@@ -880,28 +943,123 @@ def process_purchase(oid):
         notify_admin(f'🚨 BUYURTMA NOANIQ NATIJA: {oid} — {esc(str(e))[:220]}')
 
 
+_ORDER_LABELS = {
+    'completed': '✅ Yetkazildi',
+    'processing': '🚚 Yetkazilmoqda',
+    'waiting_funds': '⏳ Yetkazish kutilmoqda',
+    'review': '🔎 Tekshiruvda',
+    'refunded': '↩️ Pul qaytarildi',
+}
+
+
+def order_type_name(o):
+    if o['kind'] == 'stars':
+        return f"⭐ {o['qty']} Stars"
+    if o['kind'] == 'premium':
+        return f"💎 {o['qty']} oylik Premium"
+    return '🎁 Telegram sovg‘asi'
+
+
+def _proof_message(o):
+    # Never publish an unsuspecting third party's username; buyer may opt in
+    # only to showing THEIR OWN username for a purchase to themselves.
+    with db() as c:
+        buyer = c.execute('SELECT username,proof_opt_in FROM users WHERE id=?', (o['user_id'],)).fetchone()
+    recipient = str(o['recipient']).lstrip('@')
+    public_name = 'Maxfiy xaridor'
+    if buyer and buyer['proof_opt_in'] and buyer['username']:
+        if o['kind'] == 'gift':
+            owned = f'@{buyer["username"].lower()}' in str(o['recipient']).lower()
+        else:
+            owned = recipient.lower() == buyer['username'].lower()
+        if owned:
+            public_name = '@' + str(buyer['username'])
+    return (f'🎉 <b>Yana bir buyurtma muvaffaqiyatli yetkazildi!</b>\n\n'
+            f'🛍 Xizmat: <b>{esc(order_type_name(o))}</b>\n'
+            f'👤 Xaridor: <b>{esc(public_name)}</b>\n'
+            f'💰 Xarid: <b>{money(o["price"])}</b>\n'
+            f'✅ Holat: <b>Yetkazildi</b>\n\n'
+            f'💚 Ishonchingiz uchun rahmat!')
+
+
+def _post_proof_once(o):
+    channel = get('proof_channel').strip()
+    if not channel or not o or o['status'] not in ('processing','completed'):
+        return
+    # Claim before sending: no uncertain Telegram retry can produce a duplicate
+    # public proof post. Admin can investigate an errored post manually.
+    with db(True) as c:
+        ins = c.execute('INSERT OR IGNORE INTO proof_posts(order_id,status,created) VALUES(?,?,?)',
+                        (o['id'], 'sending', now()))
+        if ins.rowcount != 1:
+            return
+    try:
+        bot.send_message(int(channel) if channel.lstrip('-').isdigit() else channel,
+                         _proof_message(o), disable_web_page_preview=True)
+    except Exception as exc:
+        with db(True) as c:
+            c.execute('UPDATE proof_posts SET status=? WHERE order_id=?', ('error',o['id']))
+        logger.warning('Isbot kanaliga xabar yuborilmadi, order=%s: %s',
+                       o['id'],type(exc).__name__)
+        return
+    with db(True) as c:
+        c.execute('UPDATE proof_posts SET status=? WHERE order_id=?', ('sent',o['id']))
+
+
+def publish_proof(o):
+    if o and get('proof_channel').strip():
+        _PROOF_POOL.submit(_post_proof_once, o)
+
+
+def delivery_text(o):
+    return (f'✅ <b>Buyurtmangiz muvaffaqiyatli yetkazildi!</b>\n\n'
+            f'🛍 {esc(order_type_name(o))}\n'
+            f'👤 Qabul qiluvchi: <b>{esc(o["recipient"] if o["kind"] == "gift" else "@" + o["recipient"])}</b>\n'
+            f'💰 To‘langan: <b>{money(o["price"])}</b>\n\n'
+            f'💚 Xaridingiz uchun rahmat!')
+
+
 def order_card(uid, oid, admin=False):
-    with db() as c: o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
-    if not o or (not admin and o['user_id']!=uid):return safe_send(uid,'Buyurtma topilmadi.')
-    text=(f'📦 <b>Buyurtma {esc(o["id"])}</b>\n'
-          f'Turi: {"⭐ Stars" if o["kind"]=="stars" else "🎁 Gift" if o["kind"]=="gift" else "💎 Premium"}\n'
-          f'Miqdori: {o["qty"]}{" ta" if o["kind"]=="stars" else "-slot" if o["kind"]=="gift" else " oy"}\n'
-          f'Qabul qiluvchi: @{esc(o["recipient"])}\nNarx: {money(o["price"])}\n'
-          f'Holat: <b>{esc(o["status"])}</b>\nSana: {esc(o["created"])}')
-    if admin:text+=f'\nUser: <code>{o["user_id"]}</code>\nIzoh: {esc(o["detail"])[:250]}'
+    with db() as c:
+        o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
+    if not o or (not admin and o['user_id'] != uid):
+        return safe_send(uid,'Buyurtma topilmadi.')
+    status = _ORDER_LABELS.get(o['status'], '⏳ Jarayonda')
+    target = o['recipient'] if o['kind']=='gift' else '@'+o['recipient']
+    txt=(f'🛍 <b>Buyurtma ma’lumoti</b>\n\n'
+         f'📦 {esc(order_type_name(o))}\n'
+         f'👤 Qabul qiluvchi: {esc(target)}\n'
+         f'💰 Narxi: <b>{money(o["price"])}</b>\n'
+         f'📌 Holati: <b>{status}</b>\n'
+         f'📅 Sana: {esc(o["created"][:16])}')
+    if o['status']=='waiting_funds':
+        txt+='\n\n⏳ Yetkazib berish kutilmoqda. Iltimos, administratorga murojaat qiling.'
+    if admin:
+        txt+=(f'\n\n🔐 Buyurtma: <code>{esc(o["id"])}</code>'
+              f'\n🆔 Xaridor: <code>{o["user_id"]}</code>'
+              f'\nTexnik izoh: {esc(o["detail"])[:300]}')
     rows=[]
-    if admin and o['status']=='review':
-        rows=[[('✅ Yetkazilgan deb belgilash','a:done:'+oid)],
-              [('↩️ Qaytarish (faqat tekshirib)','a:refund:'+oid)]]
-    rows.append([('⬅️ Buyurtmalar','a:orders' if admin else 'u:orders')])
-    safe_send(uid,text,keyboard(rows))
+    if admin and o['status'] in ('review','waiting_funds'):
+        rows += [[('✅ Yetkazilgan deb belgilash','a:done:'+oid)],
+                 [('↩️ Pulni qaytarish','a:refund:'+oid)]]
+        if o['status']=='waiting_funds' and o['kind'] in ('stars','premium'):
+            rows.append([('🔄 To‘ldirilgach qayta yetkazish','a:retryask:'+oid)])
+    if not admin and o['status'] in ('waiting_funds','review'):
+        rows.append([('🎧 Administratorga murojaat','u:help')])
+    rows.append([('⬅️ Orqaga','a:orders' if admin else 'u:orders')])
+    return safe_send(uid,txt,keyboard(rows))
 
 
 def my_orders(uid):
-    with db() as c: items=c.execute('SELECT * FROM orders WHERE user_id=? ORDER BY created DESC LIMIT 15',(uid,)).fetchall()
-    if not items:return safe_send(uid,'📦 Hozircha buyurtmalaringiz yo‘q.')
-    rows=[[(f'{"⭐" if o["kind"]=="stars" else "🎁" if o["kind"]=="gift" else "💎"} {o["qty"]} | {o["status"]} | {o["id"][-6:]}','o:show:'+o['id'])] for o in items]
-    safe_send(uid,'📦 <b>Buyurtmalarim</b>',keyboard(rows))
+    with db() as c:
+        items=c.execute('SELECT * FROM orders WHERE user_id=? ORDER BY created DESC LIMIT 15',(uid,)).fetchall()
+    if not items:
+        return safe_send(uid,'📦 Hozircha buyurtmalaringiz yo‘q.')
+    rows=[[(f'{order_type_name(o)} · {_ORDER_LABELS.get(o["status"], "⏳ Jarayonda")}',
+            'o:show:'+o['id'])] for o in items]
+    return safe_send(uid,'📦 <b>Buyurtmalarim</b>\n\nBatafsil ko‘rish uchun tanlang:',keyboard(rows))
+
+
 
 
 # ------------------ TELEGRAM GIFTS (11 inline slots) ------------------
@@ -921,19 +1079,38 @@ def tg_api(method, payload=None):
     return obj['result']
 
 
+_GIFT_EMOJI_NAMES = {
+    '🌹':'Atirgul', '🧸':'Ayiqcha', '💝':'Yurakcha', '❤️':'Yurakcha',
+    '🌸':'Gul', '🎂':'Tort', '⭐':'Yulduz', '💍':'Uzuk',
+    '🏆':'Kubok', '🚀':'Raketa', '🎈':'Sharlar', '🎁':'Sovg‘a',
+}
+
+
+def gift_friendly_name(g):
+    name = str(g['name'] or '').strip()
+    if not name or name.isdigit() or name.lower().startswith('gift_id'):
+        return _GIFT_EMOJI_NAMES.get(str(g['emoji']), 'Telegram sovg‘asi')
+    return name
+
+
 def gift_row(slot):
     with db() as c:return c.execute('SELECT * FROM gifts WHERE slot=?',(int(slot),)).fetchone()
 
 
 def gift_catalog(uid):
     if not check_access(uid):return
-    with db() as c:
-        rows = c.execute(
-            "SELECT * FROM gifts WHERE enabled=1 AND price>0 AND gift_id<>'' ORDER BY slot"
-        ).fetchall()
+    with _CATALOG_CACHE_LOCK:
+        existing=_CATALOG_CACHE.get('gifts')
+    if existing and existing[0]>time.monotonic():
+        rows=existing[1]
+    else:
+        with db() as c:
+            rows=c.execute("SELECT * FROM gifts WHERE enabled=1 AND price>0 AND gift_id<>'' ORDER BY slot").fetchall()
+        with _CATALOG_CACHE_LOCK:
+            _CATALOG_CACHE['gifts']=(time.monotonic()+12.0,rows)
     if not rows:
         return safe_send(uid,'🎁 Sovg‘alar tez orada sotuvga qo‘yiladi.')
-    rows_k=[[(f'{x["emoji"]} {x["name"]} — {money(x["price"])}',f'g:view:{x["slot"]}')]
+    rows_k=[[(f'{x["emoji"]} {gift_friendly_name(x)} — {money(x["price"])}',f'g:view:{x["slot"]}')]
             for x in rows]
     rows_k.append([('🏠 Bosh menyu','home')])
     return safe_send(uid,'🎁 <b>Telegram sovg‘alari</b>\n\nSovg‘ani tanlang:',keyboard(rows_k))
@@ -946,7 +1123,7 @@ def gift_preview(uid,slot):
     if g['sticker_file_id']:
         try:bot.send_sticker(uid,g['sticker_file_id'])
         except Exception:logger.info('Gift stiker yuborilmadi: slot=%s',slot)
-    return safe_send(uid,f'{esc(g["emoji"])} <b>{esc(g["name"])}</b>\n\n'
+    return safe_send(uid,f'{esc(g["emoji"])} <b>{esc(gift_friendly_name(g))}</b>\n\n'
              f'💰 Narxi: <b>{money(g["price"])}</b>\n'
              'Kimga sovg‘a qilasiz?',keyboard([
                  [('👤 O‘zimga',f'g:self:{slot}'),('🎁 Do‘stimga',f'g:friend:{slot}')],
@@ -1073,9 +1250,15 @@ def buy_gift(uid):
         finish_order(oid,'review',str(exc)[:260])
         notify_admin(f'🚨 Gift buyurtma tekshiruvda: {oid}\n{esc(str(exc))[:140]}')
         return safe_send(uid,'⚠️ Sovg‘a buyurtmangiz tekshiruvda. Iltimos, qayta xarid qilmang.')
-    finish_order(oid,'completed','Telegram Bot API sendGift: OK')
-    safe_send(uid,f'✅ <b>Sovg‘a yuborildi!</b>\n🎁 {esc(g["name"])}\n'
-                  f'👤 {esc(data["target_username"])}\n📦 Buyurtma: {esc(oid)}')
+    done=finish_order(oid,'completed','Telegram Bot API sendGift: OK')
+    if not done:
+        return
+    with db() as c:
+        completed_gift=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
+    safe_send(uid, f'✅ <b>Sovg‘angiz muvaffaqiyatli yetkazildi!</b>\n\n'
+                   f'🎁 {esc(g["name"])}\n👤 Qabul qiluvchi: {esc(data["target_username"])}\n'
+                   f'💰 Narxi: {money(g["price"])}\n\n💚 Xaridingiz uchun rahmat!')
+    publish_proof(completed_gift if completed_gift else None)
     notify_admin(f'🎁 Gift bajarildi: {oid} | {esc(g["name"])} | {money(g["price"])}')
 
 
@@ -1124,7 +1307,9 @@ def admin_gift_choices(uid,slot):
             c.execute('INSERT OR IGNORE INTO settings(key,val) VALUES(?,?)',
                       ('giftcache_'+gid,json.dumps(item,ensure_ascii=False)))
     set_state(uid,'admin_giftpick',{'slot':slot})
-    rows=[[(f'🎁 {i+1}. {it.get("star_count",0)} ⭐',f'a:gset:{slot}:{i}')]
+    rows=[[(f'{(it.get("sticker") or {}).get("emoji") or "🎁"} '
+             f'{_GIFT_EMOJI_NAMES.get((it.get("sticker") or {}).get("emoji"), "Telegram sovg‘asi")} · '
+             f'{it.get("star_count",0)} ⭐',f'a:gset:{slot}:{i}')]
           for i,it in enumerate(items[:60])]
     # index mapping stored under a cache key with a stable session for this admin
     put('gift_pick_ids_'+str(uid),json.dumps([str(it.get('id','')) for it in items[:60]]))
@@ -1141,8 +1326,9 @@ def admin_sync_gifts(uid):
             row=c.execute('SELECT gift_id FROM gifts WHERE slot=?',(slot,)).fetchone()
             if row and row['gift_id']:continue
             sticker=it.get('sticker') or {}
-            c.execute('UPDATE gifts SET gift_id=?,sticker_file_id=?,stars_cost=? WHERE slot=?',
-                      (str(it['id']),str(sticker.get('file_id','')),int(it.get('star_count',0)),slot))
+            emoji = sticker.get('emoji') or '🎁'
+            c.execute('UPDATE gifts SET gift_id=?,sticker_file_id=?,stars_cost=?,emoji=? WHERE slot=?',
+                      (str(it['id']),str(sticker.get('file_id','')),int(it.get('star_count',0)),emoji,slot))
     return safe_send(uid,'✅ Telegram Giftlar yuklandi. Narxlarni belgilab, sotuvni yoqing.',
                      keyboard([[('🎁 Gift boshqaruvi','a:gift:menu')]]))
 
@@ -1663,8 +1849,13 @@ def balance_history(uid):
     with db() as c: rows=c.execute('SELECT * FROM ledger WHERE user_id=? ORDER BY id DESC LIMIT 15',(uid,)).fetchall()
     if not rows:return safe_send(uid,'🧾 Hozircha tranzaksiyalar yo‘q.')
     text='🧾 <b>Balans harakatlari</b>\n\n'
+    labels={'bank_credit':'Hisob to‘ldirildi','order_debit':'Xarid uchun yechildi',
+            'order_refund':'Pul qaytarildi','referral_transfer':'Referal bonus o‘tkazildi',
+            'referral_bonus':'Referal bonusi'}
     for r in rows:
-        text+=f'{"➕" if r["delta"]>0 else "➖"} {money(abs(r["delta"]))} | {esc(r["reason"])} | {esc(r["created"][:16])}\n'
+        reason=('Administrator o‘zgartirdi' if r['reason'].startswith('admin_')
+                else labels.get(r['reason'],'Hisob harakati'))
+        text+=f'{"➕" if r["delta"]>0 else "➖"} {money(abs(r["delta"]))} | {esc(reason)} | {esc(r["created"][:16])}\n'
     safe_send(uid,text[:4000])
 
 
@@ -1674,10 +1865,14 @@ def profile(uid):
     with db() as c:
         x=c.execute("SELECT COUNT(*) as n, COALESCE(SUM(CASE WHEN status='completed' THEN price ELSE 0 END),0) AS sold FROM orders WHERE user_id=?",(uid,)).fetchone()
     safe_send(uid,f'💰 <b>Hisobim</b>\n\n👤 {esc(r["name"])}\n'
-              f'🔗 @{esc(r["username"] or "username yo‘q")}\n🆔 <code>{uid}</code>\n'
+              f'🔗 @{esc(r["username"] or "username yo‘q")}\n'
               f'💳 Balans: <b>{money(r["balance"])}</b>\n'
-              f'📦 Buyurtmalar: {x["n"]} ta\n🛍 Bajarilgan xarid: {money(x["sold"])}',
-              keyboard([[('🧾 Tranzaksiyalar tarixi','u:ledger')],[('💳 Hisob to‘ldirish','top:menu')]]))
+              f'📦 Buyurtmalar: {x["n"]} ta\n🛍 Bajarilgan xarid: {money(x["sold"])}\n\n'
+              '📣 Isbotlar kanalida xarid turi va miqdori ko‘rsatilishi mumkin. '
+              'Ismingiz faqat ruxsat bersangiz ochiq chiqadi.',
+              keyboard([[('🧾 Tranzaksiyalar tarixi','u:ledger')],[('💳 Hisob to‘ldirish','top:menu')],
+                        [(('🟢 Ismim ochiq — maxfiy qilish' if r['proof_opt_in'] else
+                           '🔒 Ismim maxfiy — ochiq qilish'),'u:proof:toggle')]]))
 
 
 def report_ticket(uid, m):
@@ -1721,7 +1916,8 @@ def admin_premium(uid):
 
 
 def admin_orders(uid):
-    with db() as c:items=c.execute('SELECT * FROM orders ORDER BY created DESC LIMIT 20').fetchall()
+    with db() as c:
+        items=c.execute("SELECT * FROM orders ORDER BY CASE WHEN status='waiting_funds' THEN 0 WHEN status='review' THEN 1 ELSE 2 END, created DESC LIMIT 20").fetchall()
     if not items:return safe_send(uid,'📦 Hozircha buyurtmalar yo‘q.')
     safe_send(uid,'📦 <b>Oxirgi 20 buyurtma</b>',keyboard([[(f'{o["id"][-6:]} | {o["status"]} | {o["qty"]}', 'a:order:'+o['id'])] for o in items]))
 
@@ -1775,6 +1971,25 @@ def admin_integrations(uid):
 
 
 
+def admin_proof_channel(uid):
+    if not is_admin(uid):return
+    channel=get('proof_channel')
+    return safe_send(uid,'📣 <b>Isbotlar kanali</b>\n\n'
+                     f'📡 Kanal: <code>{esc(channel)}</code>' if channel else
+                     '📣 <b>Isbotlar kanali</b>\n\n📡 Hozircha sozlanmagan.\n\n'
+                     'Har bir muvaffaqiyatli yetkazish uchun anonim e’lon yuboriladi. '
+                     'Mijoz o‘zi ruxsat bersa, o‘ziga qilingan xaridda username ham ko‘rinadi.',
+                     keyboard([[('➕ Kanalni o‘rnatish','a:input:proof_channel')],
+                               [('🗑 Kanalni olib tashlash','a:proof:clear')],
+                               [('🧪 Test e’lon','a:proof:test')]]))
+
+
+def proof_toggle(uid):
+    with db(True) as c:
+        c.execute('UPDATE users SET proof_opt_in=1-proof_opt_in WHERE id=?',(uid,))
+    return profile(uid)
+
+
 def admin_channels(uid):
     chs = channel_rows()
     lines='\n'.join(esc(x['val'].split('|')[0]) for x in chs)
@@ -1797,18 +2012,74 @@ def admin_settings(uid):
                         [('✍️ Salomlashuv matni','a:input:welcome')]]))
 
 
-def admin_users(uid):
-    safe_send(uid,'👥 Foydalanuvchi ID raqamini kiriting.',keyboard([[('🔎 ID bo‘yicha qidirish','a:input:user_find')]]))
+def admin_users(uid, page=0):
+    if not is_admin(uid):
+        return
+    page = max(0, min(100000, int(page)))
+    with db() as c:
+        count = c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
+        rows = c.execute('SELECT id,name,username,balance,banned FROM users ORDER BY created DESC,id DESC LIMIT ? OFFSET ?',
+                         (10, page*10)).fetchall()
+    if page and not rows:
+        return admin_users(uid,0)
+    keys = [[(f'{"🚫" if r["banned"] else "👤"} {r["name"][:14]} '
+              f'{"@"+r["username"] if r["username"] else ""}',
+              'a:user:card:'+str(r['id']))] for r in rows]
+    keys.append([('🔎 ID yoki @username orqali qidirish','a:input:user_find')])
+    nav=[]
+    if page:nav.append(('⬅️ Oldingi','a:users:page:'+str(page-1)))
+    if (page+1)*10<count:nav.append(('Keyingi ➡️','a:users:page:'+str(page+1)))
+    if nav:keys.append(nav)
+    return safe_send(uid,f'👥 <b>Foydalanuvchilar</b>\n\nJami: {count} ta · Sahifa {page+1}',keyboard(keys))
 
 
 def user_admin_card(uid,target):
-    r=user_row(target)
+    if not is_admin(uid):return
+    with db() as c:
+        r=c.execute('SELECT * FROM users WHERE id=?',(target,)).fetchone()
+        x=c.execute("SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN status='completed' THEN price ELSE 0 END),0) spent FROM orders WHERE user_id=?",(target,)).fetchone()
+        p=c.execute('SELECT COUNT(*) n FROM payments WHERE user_id=?',(target,)).fetchone()
     if not r:return safe_send(uid,'Bunday foydalanuvchi bazada yo‘q.')
-    safe_send(uid,f'👤 <b>Foydalanuvchi</b>\n🆔 <code>{target}</code>\n'
-              f'Ism: {esc(r["name"])}\n@{esc(r["username"])}\n'
-              f'Balans: <b>{money(r["balance"])}</b>\nBloklangan: {"HA" if r["banned"] else "YO‘Q"}',
-              keyboard([[('➕/➖ Balansni tahrirlash','a:balance:'+str(target))],
-                        [('🚫 Bloklash / ochish','a:ban:'+str(target))]]))
+    return safe_send(uid,f'👤 <b>Foydalanuvchi</b>\n\n🆔 <code>{target}</code>\n'
+                     f'Ism: {esc(r["name"])}\n'
+                     f'Username: {"@"+esc(r["username"]) if r["username"] else "Mavjud emas"}\n'
+                     f'💳 Balans: <b>{money(r["balance"])}</b>\n'
+                     f'🎁 Referal balans: <b>{money(r["referral_balance"])}</b>\n'
+                     f'📦 Buyurtmalar: {x["n"]} ta\n'
+                     f'✅ Yetkazilgan xaridlar: {money(x["spent"])}\n'
+                     f'💵 To‘lovlar: {p["n"]} ta\n'
+                     f'🚫 Bloklangan: {"HA" if r["banned"] else "YO‘Q"}',
+                     keyboard([[('➕/➖ Balans','a:balance:'+str(target)),
+                                ('🚫 Bloklash / ochish','a:ban:'+str(target))],
+                               [('📦 Buyurtmalari','a:user:orders:'+str(target)),
+                                ('🧾 Hisob tarixi','a:user:ledger:'+str(target))],
+                               [('✉️ Xabar yuborish','a:user:dm:'+str(target))],
+                               [('⬅️ Foydalanuvchilar','a:users:page:0')]]))
+
+
+def admin_user_orders(uid,target):
+    if not is_admin(uid):return
+    with db() as c:
+        rows=c.execute('SELECT * FROM orders WHERE user_id=? ORDER BY created DESC LIMIT 10',(target,)).fetchall()
+    if not rows:return safe_send(uid,'Ushbu foydalanuvchida buyurtmalar yo‘q.')
+    keys=[[(f'{order_type_name(o)} · {_ORDER_LABELS.get(o["status"],"Jarayonda")}',
+            'a:order:'+o['id'])] for o in rows]
+    keys.append([('⬅️ Foydalanuvchiga qaytish','a:user:card:'+str(target))])
+    return safe_send(uid,'📦 <b>Foydalanuvchi buyurtmalari</b>',keyboard(keys))
+
+
+def admin_user_ledger(uid,target):
+    if not is_admin(uid):return
+    with db() as c:
+        rows=c.execute('SELECT delta,reason,created FROM ledger WHERE user_id=? ORDER BY id DESC LIMIT 12',(target,)).fetchall()
+    descriptions={'bank_credit':'To‘lov', 'order_debit':'Xarid','order_refund':'Qaytarildi',
+                  'referral_transfer':'Referal o‘tkazildi'}
+    txt='🧾 <b>Hisob harakatlari</b>\n\n'
+    for x in rows:
+        txt+=f'{"➕" if x["delta"]>0 else "➖"} {money(abs(x["delta"]))} · {esc(descriptions.get(x["reason"],"Admin o‘zgartirishi"))}\n'
+    if not rows:txt+='Hozircha harakatlar yo‘q.'
+    return safe_send(uid,txt[:3800],keyboard([[('⬅️ Foydalanuvchi','a:user:card:'+str(target))]]))
+
 
 
 def admin_tickets(uid):
@@ -1834,12 +2105,12 @@ def broadcast_admin(uid):
 
 
 def admin_input(uid,k):
-    owner_keys={'fragment_key','usd_rate','admin_add','admin_del','payment_card_number','payment_card_name'}
+    owner_keys={'fragment_key','usd_rate','admin_add','admin_del','payment_card_number','payment_card_name','proof_channel'}
     if k in owner_keys and not only_owner(uid):return safe_send(uid,'🔒 Faqat bosh admin.')
     allowed={'star_price','pack_add','pack_del','min_stars','max_stars','premium_3','premium_6','premium_12',
              'fragment_key','usd_rate','channel_add','channel_del',
              'admin_add','admin_del','min_topup','welcome','user_find',
-             'payment_card_number','payment_card_name'}
+             'payment_card_number','payment_card_name','proof_channel'}
     if k not in allowed:return
     set_state(uid,'admin_input',{'key':k})
     prompt={
@@ -1848,12 +2119,13 @@ def admin_input(uid,k):
       'payment_card_number':'HUMO karta raqamini kiriting (16–19 raqam). To‘lov paytida foydalanuvchiga shu karta chiqadi.',
       'payment_card_name':'HUMO karta egasining ism va familiyasini kiriting.',
       'usd_rate':'1 USD necha so‘m? (Masalan: 12500).',
+      'proof_channel':'Isbotlar kanali @username yoki -100... ID sini yuboring. Bot kanalda admin bo‘lsin.',
       'channel_add':'Kanalni kiriting: @kanal yoki -100... ID. Private kanal uchun: -100...|https://t.me/+invite',
       'channel_del':'O‘chiriladigan kanal @username yoki ID sini kiriting.',
       'admin_add':'Yangi admin Telegram ID sini yuboring.', 'admin_del':'O‘chirish uchun admin ID sini yuboring.',
       'pack_add':'Stars to‘plam miqdorini yuboring (masalan 750).',
       'pack_del':'O‘chirish uchun Stars to‘plam miqdorini yuboring.',
-      'user_find':'Foydalanuvchining Telegram ID sini kiriting.',
+      'user_find':'Foydalanuvchining Telegram ID raqami yoki @username sini kiriting.',
       'min_topup':'Minimal to‘lov summasini so‘mda yuboring.',
       'min_stars':'Minimal Stars miqdorini kiriting (kamida 50).',
       'max_stars':'Maksimal Stars miqdorini kiriting.',
@@ -1868,10 +2140,20 @@ def handle_admin_input(m,data):
     k=data.get('key','')
     if not is_admin(uid):return
     if k in {'fragment_key','usd_rate','admin_add','admin_del',
-              'payment_card_number','payment_card_name'} and not only_owner(uid):return
+              'payment_card_number','payment_card_name','proof_channel'} and not only_owner(uid):return
     value=(m.text or '').strip()
     if not value:return safe_send(uid,'Matn yuboring.')
     try:
+        if k=='proof_channel':
+            if not (re.fullmatch(r'@[A-Za-z0-9_]{5,32}',value) or re.fullmatch(r'-100[0-9]{5,20}',value)):
+                raise ValueError('Kanal @username yoki -100... ID formatida bo‘lsin.')
+            chat=bot.get_chat(value)
+            member=bot.get_chat_member(chat.id,bot.get_me().id)
+            if member.status not in ('administrator','creator'):
+                raise ValueError('Botni isbotlar kanaliga admin qiling.')
+            put('proof_channel',str(chat.id))
+            clear_state(uid)
+            return admin_proof_channel(uid)
         if k=='fragment_key':
             set_secret(k,value)
             try:bot.delete_message(uid,m.message_id)
@@ -1923,7 +2205,13 @@ def handle_admin_input(m,data):
                 if k=='admin_add':c.execute('INSERT OR IGNORE INTO admins(id) VALUES(?)',(n,))
                 else:c.execute('DELETE FROM admins WHERE id=?',(n,))
         elif k=='user_find':
-            n=int(value)
+            if value.startswith('@'):
+                with db() as c:
+                    r=c.execute('SELECT id FROM users WHERE LOWER(username)=LOWER(?)',(value[1:],)).fetchone()
+                if not r:raise ValueError('Bunday username topilmadi.')
+                n=int(r['id'])
+            else:
+                n=int(value)
             clear_state(uid)
             return user_admin_card(uid,n)
         elif k=='welcome':
@@ -2329,8 +2617,8 @@ def callbacks(call):
             if item is None:return safe_send(uid,'Bu Gift hozir sotuvda yo‘q.')
             stk=item.get('sticker') or {}
             with db(True) as c:
-                c.execute('UPDATE gifts SET gift_id=?,sticker_file_id=?,stars_cost=?,enabled=0 WHERE slot=?',
-                          (str(item['id']),str(stk.get('file_id','')),int(item['star_count']),slot))
+                c.execute('UPDATE gifts SET gift_id=?,sticker_file_id=?,stars_cost=?,emoji=?,enabled=0 WHERE slot=?',
+                          (str(item['id']),str(stk.get('file_id','')),int(item['star_count']),stk.get('emoji') or '🎁',slot))
             safe_send(uid,'✅ Gift tanlandi. Sotuv narxini qo‘yib, yoqing.')
             return admin_gift_slot(uid,slot)
         except Exception:return safe_send(uid,'Sovg‘ani qayta tanlang.')
@@ -2384,6 +2672,13 @@ def callbacks(call):
         if not check_access(uid):return
         if not LIVE_SALES_ENABLED:return safe_send(uid,'Xarid vaqtincha o‘chirilgan.')
         if not read_secret('fragment_key'):return safe_send(uid,'❌ API kaliti sozlanmagan.')
+        step,order_data=state(uid)
+        if step=='review_order':
+            with db() as c:
+                user_balance=c.execute('SELECT balance FROM users WHERE id=?',(uid,)).fetchone()
+            if not user_balance or user_balance['balance']<order_data['total']:
+                return safe_send(uid,'❌ Balansingiz yetarli emas. Avval hisobingizni to‘ldiring.',
+                                 keyboard([[('💳 Hisob to‘ldirish','top:menu')]]))
         if not _PURCHASE_CAPACITY.acquire(blocking=False):
             return safe_send(uid,'⏳ Xaridlar navbati band. Qayta urinib ko‘ring.')
         # Mark claimed INSIDE one transaction. Two rapid clicks cannot debit twice.
@@ -2433,8 +2728,33 @@ def callbacks(call):
         return payment_card(uid,pid,admin=is_admin(uid))
     if s.startswith('pay:show:'):return payment_card(uid,s.split(':',2)[2])
     if s.startswith('o:show:'):return order_card(uid,s.split(':',2)[2])
+    if s=='u:help':
+        if not check_access(uid):return
+        set_state(uid,'user_support')
+        return safe_send(uid,'🎧 <b>Adminga murojaat</b>\n\nMuammoingizni yozing yoki rasm yuboring. Bekor qilish: /cancel')
+    if s=='u:proof:toggle':return proof_toggle(uid)
     if s=='u:ledger':return balance_history(uid)
     if s=='u:orders':return my_orders(uid)
+    if s=='a:proof:clear':
+        if not only_owner(uid):return safe_send(uid,'Faqat bosh admin uchun.')
+        put('proof_channel','')
+        return admin_proof_channel(uid)
+    if s=='a:proof:test':
+        if not only_owner(uid):return safe_send(uid,'Faqat bosh admin uchun.')
+        channel=get('proof_channel')
+        if not channel:return safe_send(uid,'Avval kanalni o‘rnating.')
+        try:
+            bot.send_message(int(channel),'🧪 Isbotlar kanali sozlandi. Bu sinov xabari.')
+        except Exception as e:return safe_send(uid,'❌ Kanalga yozilmadi: '+esc(type(e).__name__))
+        return safe_send(uid,'✅ Sinov e’loni kanalga yuborildi.')
+    if s=='a:users:page:0':return admin_users(uid,0)
+    if s.startswith('a:users:page:'):return admin_users(uid,int(s.rsplit(':',1)[1]))
+    if s.startswith('a:user:card:'):return user_admin_card(uid,int(s.rsplit(':',1)[1]))
+    if s.startswith('a:user:orders:'):return admin_user_orders(uid,int(s.rsplit(':',1)[1]))
+    if s.startswith('a:user:ledger:'):return admin_user_ledger(uid,int(s.rsplit(':',1)[1]))
+    if s.startswith('a:user:dm:'):
+        target=int(s.rsplit(':',1)[1]);set_state(uid,'admin_user_message',{'user':target})
+        return safe_send(uid,'✉️ Foydalanuvchiga yuboriladigan xabarni yuboring (matn, rasm yoki video).')
     if s=='a:orders':return admin_orders(uid)
     if s.startswith('a:order:'):return order_card(uid,s.split(':',2)[2],admin=True)
     if s.startswith('a:pay:'):return payment_card(uid,s.split(':',2)[2],admin=True)
@@ -2479,10 +2799,35 @@ def callbacks(call):
         if target in admin_ids():return safe_send(uid,'Adminni bloklab bo‘lmaydi.')
         with db(True) as c:c.execute('UPDATE users SET banned=1-banned WHERE id=?',(target,))
         return user_admin_card(uid,target)
+    if s.startswith('a:retryask:'):
+        if not only_owner(uid):return safe_send(uid,'Faqat bosh admin uchun.')
+        oid=s.rsplit(':',1)[1]
+        with db() as c:
+            o=c.execute('SELECT kind,status FROM orders WHERE id=?',(oid,)).fetchone()
+        if not o or o['status']!='waiting_funds' or o['kind'] not in ('stars','premium'):
+            return safe_send(uid,'Bu buyurtmani qayta yetkazib bo‘lmaydi.')
+        return safe_send(uid,
+          f'⚠️ <b>Qayta yetkazishni tasdiqlang</b>\n\n'
+          f'Buyurtma: <code>{esc(oid)}</code>\n'
+          'Fragment hamyoningizni to‘ldirdingizmi?\n'
+          'Avval Fragment tarixidan ushbu buyurtma haqiqatda yetkazilmaganini tekshiring. '
+          'Aks holda Stars yoki Premium ikki marta yuborilishi mumkin.',
+          keyboard([[('✅ Tekshirdim, qayta yetkazish','a:retryconfirm:'+oid)],
+                    [('❌ Bekor','a:order:'+oid)]]))
+    if s.startswith('a:retryconfirm:'):
+        if not only_owner(uid):return safe_send(uid,'Faqat bosh admin uchun.')
+        oid=s.rsplit(':',1)[1]
+        with db(True) as c:
+            updated=c.execute("UPDATE orders SET status='processing',updated=? WHERE id=? AND status='waiting_funds' AND kind IN ('stars','premium')",(now(),oid))
+            changed=updated.rowcount==1
+        if not changed:return safe_send(uid,'Bu buyurtma allaqachon ko‘rib chiqilgan.')
+        _PURCHASE_POOL.submit(process_purchase,oid)
+        return safe_send(uid,'🚚 Buyurtma qayta yetkazishga yuborildi. Natija avtomatik keladi.')
     if s.startswith('a:done:') or s.startswith('a:refund:'):
         oid=s.split(':',2)[2]
         with db() as c:o=c.execute('SELECT status FROM orders WHERE id=?',(oid,)).fetchone()
-        if not o or o['status']!='review':return safe_send(uid,'Buyurtma tekshiruvda emas.')
+        if not o or o['status'] not in ('review','waiting_funds'):
+            return safe_send(uid,'Bu buyurtmani hozir qo‘lda yopib bo‘lmaydi.')
         action='done' if s.startswith('a:done:') else 'refund'
         choice = 'YETKAZILGAN' if action=='done' else 'PULNI QAYTARISH'
         return safe_send(uid,f'⚠️ {oid}: {choice}\n'
@@ -2493,7 +2838,11 @@ def callbacks(call):
         if action not in ('refund','done'):return
         o=finish_order(oid,'refunded' if action=='refund' else 'completed','Admin tekshirgan: '+str(uid))
         if o:
-            safe_send(o['user_id'],f'🧾 Buyurtma {oid}: '+('pul balansga qaytarildi' if action=='refund' else 'yetkazish tasdiqlandi'))
+            if action=='done':
+                safe_send(o['user_id'],delivery_text(o))
+                publish_proof(o)
+            else:
+                safe_send(o['user_id'],'↩️ Buyurtmangiz uchun to‘langan mablag‘ balansingizga qaytarildi.')
             safe_send(uid,'✅ Holat o‘zgartirildi.')
         return
     if s.startswith('t:'):
@@ -2546,6 +2895,7 @@ def messages(m):
         '🔌 API va to‘lov':admin_integrations,'📢 Xabar yuborish':broadcast_admin,
         '📣 Majburiy obuna':admin_channels,'👑 Adminlar':admin_admins,
         '🎧 Murojaatlar':admin_tickets,'⚙️ Sozlamalar':admin_settings,
+        '📣 Isbotlar kanali':admin_proof_channel,
     }
     if text in admin_texts:
         if not is_admin(uid):return safe_send(uid,'⛔ Ruxsat yo‘q.')
@@ -2580,6 +2930,16 @@ def messages(m):
     if step=='admin_balance':
         if is_admin(uid):return handle_admin_adjust(m,data)
         return
+    if step=='admin_user_message':
+        if not is_admin(uid):return
+        target=int(data['user'])
+        try:
+            bot.copy_message(target,uid,m.message_id)
+        except Exception as exc:
+            logger.warning('Admin user xabar yuborilmadi: %s',type(exc).__name__)
+            return safe_send(uid,'❌ Foydalanuvchiga yuborilmadi. U botni bloklagan bo‘lishi mumkin.')
+        clear_state(uid)
+        return safe_send(uid,'✅ Foydalanuvchiga xabar yetkazildi.')
     if step=='admin_broadcast':return send_broadcast(m)
     if step=='admin_reply':
         if not is_admin(uid):return
@@ -2628,6 +2988,7 @@ def initialize_runtime():
     # Verification jobs are not monetary debits: recover if Render restarted.
     with db(True) as c:
         c.execute("UPDATE states SET step='review_order' WHERE step='checking_price'")
+        c.execute("UPDATE states SET step='enter_recipient' WHERE step='checking_recipient'")
         c.execute("UPDATE states SET step='gift_review' WHERE step='gift_processing'")
     # O'rtada server to'xtagan buyurtmalarni qayta yubormaymiz.
     # 5 daqiqadan eski processing holati qo'lda tekshirishga yuboriladi.
