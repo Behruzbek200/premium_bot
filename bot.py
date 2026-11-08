@@ -119,6 +119,22 @@ _SUBSCRIPTION_CACHE_LOCK = threading.Lock()
 _REQUEST_CACHE = contextvars.ContextVar('request_cache', default=None)
 _BOT_USERNAME = None
 _HTTP_LOCAL = threading.local()
+# Ban/maintenance are still enforced. Caching limits remote DB round trips,
+# and admin ban actions invalidate the specific cached account immediately.
+_ACCESS_CACHE = {}
+_ACCESS_CACHE_LOCK = threading.Lock()
+_ACCESS_TTL = 7.0
+_EMPTY_STATE_CACHE = {}
+_EMPTY_STATE_LOCK = threading.Lock()
+
+# Telegram reply keyboards need a new bot message to refresh after a toggle.
+_MENU_REFRESH_STARTED = threading.Event()
+_MENU_REFRESH_WAKE = threading.Event()
+# Only deterministic insufficient-funds orders may be retried automatically.
+_WALLET_RETRY_STARTED = threading.Event()
+_WALLET_RETRY_WAKE = threading.Event()
+_WALLET_RETRY_SECONDS = 12.0
+
 
 
 def http_session():
@@ -316,6 +332,8 @@ def setup_db():
         CREATE INDEX IF NOT EXISTS ix_pay_user ON payments(user_id,created);
         CREATE TABLE IF NOT EXISTS proof_posts (
           order_id TEXT PRIMARY KEY, status TEXT NOT NULL, created TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS keyboard_refresh_queue (
+          user_id INTEGER PRIMARY KEY, requested TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS bank_events (
           sender_id BIGINT NOT NULL, message_id BIGINT NOT NULL,
           tx_ref TEXT NOT NULL UNIQUE, amount BIGINT NOT NULL,
@@ -365,7 +383,7 @@ def setup_db():
           'public_url':'', 'payment_enabled':'1',
           'fragment_key': '', 'referral_percent': '5', 'referral_enabled': '1',
           'payment_card_number': '', 'payment_card_name': '',
-          'proof_channel': '',
+          'proof_channel': '', 'proofs_visible': '0',
           'telegram_webhook_path': secrets.token_urlsafe(26),
           'telegram_header_secret': secrets.token_urlsafe(32),
           'payment_monitor_token': secrets.token_urlsafe(30)
@@ -594,6 +612,8 @@ def set_state(uid,step,data=None):
     with db(True) as c:
         c.execute('INSERT INTO states(user_id,step,data) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET step=excluded.step,data=excluded.data',
                   (uid,step,json.dumps(data or {},ensure_ascii=False)))
+    with _EMPTY_STATE_LOCK:
+        _EMPTY_STATE_CACHE.pop(uid,None)
 
 
 def state(uid):
@@ -603,7 +623,15 @@ def state(uid):
 
 
 def clear_state(uid):
-    with db(True) as c: c.execute('DELETE FROM states WHERE user_id=?',(uid,))
+    instant=time.monotonic()
+    with _EMPTY_STATE_LOCK:
+        if _EMPTY_STATE_CACHE.get(uid,0)>instant:
+            return
+    with db(True) as c:
+        c.execute('DELETE FROM states WHERE user_id=?',(uid,))
+    with _EMPTY_STATE_LOCK:
+        if len(_EMPTY_STATE_CACHE)>10000:_EMPTY_STATE_CACHE.clear()
+        _EMPTY_STATE_CACHE[uid]=time.monotonic()+20.0
 
 
 def keyboard(rows):
@@ -613,7 +641,84 @@ def keyboard(rows):
     return k
 
 
-def menu_kb(admin=False):
+def proof_channel_link():
+    """Use explicit invite links for private channels; otherwise @public name."""
+    raw=get('proof_channel').strip()
+    if not raw:
+        return ''
+    parts=raw.split('|',1)
+    link=parts[1].strip() if len(parts)>1 else ''
+    if link.startswith('https://t.me/'):
+        return link
+    if parts[0].startswith('@'):
+        return 'https://t.me/'+parts[0][1:]
+    return ''
+
+
+def proofs_visible():
+    return get('proofs_visible') == '1' and bool(get('proof_channel').strip())
+
+
+def proof_channel_menu(uid):
+    if not proofs_visible():
+        return safe_send(uid,'📣 Isbotlar bo‘limi hozir o‘chirilgan.',menu_kb(uid=uid))
+    link=proof_channel_link()
+    if not link:
+        return safe_send(uid,'📣 Kanal havolasi hali admin tomonidan kiritilmagan.')
+    markup=types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton('📣 Isbotlarni ko‘rish',url=link))
+    return safe_send(uid,'✅ Muvaffaqiyatli yetkazilgan buyurtmalar isbotlari:',markup)
+
+
+def invalidate_access(uid=None):
+    with _ACCESS_CACHE_LOCK:
+        if uid is None:
+            _ACCESS_CACHE.clear()
+        else:
+            _ACCESS_CACHE.pop(uid,None)
+
+
+def queue_keyboard_refresh():
+    """Persist menu refresh: does not block the admin or lose users on restart."""
+    with db(True) as c:
+        c.execute("INSERT INTO keyboard_refresh_queue(user_id,requested) SELECT id,? FROM users WHERE banned=0 ON CONFLICT(user_id) DO UPDATE SET requested=excluded.requested",
+                  (str(time.time_ns()),))
+    _MENU_REFRESH_WAKE.set()
+
+
+def _refresh_menu_worker():
+    while True:
+        try:
+            with db() as c:
+                rows=c.execute('SELECT user_id,requested FROM keyboard_refresh_queue ORDER BY requested LIMIT 10').fetchall()
+            if not rows:
+                _MENU_REFRESH_WAKE.wait(10.0)
+                _MENU_REFRESH_WAKE.clear()
+                continue
+            for row in rows:
+                user_id=int(row['user_id'])
+                text='📣 Isbotlar tugmasi menyuga qo‘shildi.' if proofs_visible() else '📣 Isbotlar tugmasi menyudan olib tashlandi.'
+                try:
+                    bot.send_message(user_id,text,reply_markup=menu_kb(uid=user_id))
+                except Exception as exc:
+                    logger.warning('Menyu yangilash: user=%s error=%s',user_id,type(exc).__name__)
+                with db(True) as c:
+                    c.execute('DELETE FROM keyboard_refresh_queue WHERE user_id=? AND requested=?',
+                              (user_id,row['requested']))
+                time.sleep(0.09)
+        except Exception:
+            logger.exception('Menyu yangilash navbati xatosi')
+            time.sleep(5)
+
+
+def start_menu_refresh_worker():
+    if _MENU_REFRESH_STARTED.is_set():
+        return
+    _MENU_REFRESH_STARTED.set()
+    threading.Thread(target=_refresh_menu_worker,daemon=True,name='menu-refresh').start()
+
+
+def menu_kb(admin=False, uid=None):
     k=types.ReplyKeyboardMarkup(resize_keyboard=True)
     if admin:
         buttons=[('⭐ Stars narxlari','💎 Premium narxlari'),('🎁 Gift boshqaruvi','👥 Referal sozlamalari'),('⭐ Bot Stars balansi','📦 Buyurtmalar'),('👥 Foydalanuvchilar',),
@@ -622,6 +727,14 @@ def menu_kb(admin=False):
     else:
         buttons=[('⭐ Stars olish','💎 Premium olish'),('🎁 Gift olish','👥 Referal'),('💳 Hisob to‘ldirish','💰 Hisobim'),
                  ('📦 Buyurtmalarim','🎧 Yordam')]
+        if proofs_visible():
+            buttons.append(('📣 Isbotlar',))
+        # All admins have a one-tap path back to the admin panel.
+        # The admin menu already contains '🏠 User menyu'.
+        # Include the admin button only in the user keyboard.
+        # (Uses cached auth for owner and a cached SQL result for added admins.)
+        if uid is not None and is_admin(uid):
+            buttons.append(('👑 Admin panel',))
     for row in buttons: k.row(*[types.KeyboardButton(s) for s in row])
     return k
 
@@ -637,7 +750,7 @@ def main_menu(uid):
         r = user_row(uid)
         name = esc(r['name'] if r else 'do‘stimiz')
     greeting=get('welcome').strip() or f'Assalomu alaykum, <b>{name}</b>! 👋\n\n⭐ Stars, 💎 Premium va 🎁 Gift xarid qilish botiga xush kelibsiz!'
-    safe_send(uid,greeting+'\n\n🛍 Kerakli bo‘limni tanlang:',menu_kb())
+    safe_send(uid,greeting+'\n\n🛍 Kerakli bo‘limni tanlang:',menu_kb(uid=uid))
 
 
 def admin_menu(uid):
@@ -702,23 +815,39 @@ def sub_prompt(uid, missing):
     safe_send(uid,'🔒 Botdan foydalanish uchun kanal(lar)ga obuna bo‘ling.',k)
 
 
-def check_access(uid):
+def check_access(uid, check_subscription=False):
+    """Mandatory channels ONLY on /start and the explicit subscribe-check button.
+
+    A short cached banned flag cuts one Supabase trip on every ordinary menu tap.
+    The ban/maintenance state remains enforced, including during checkout.
+    """
     request_cache = _REQUEST_CACHE.get()
     key=('access',uid)
-    if request_cache is not None and key in request_cache:
+    if request_cache is not None and key in request_cache and not check_subscription:
         return request_cache[key]
-    u=user_row(uid)
-    if u and u['banned'] and uid!=OWNER_ID:
-        if request_cache is not None: request_cache[key]=False
-        safe_send(uid,'🚫 Hisobingiz vaqtincha bloklangan.'); return False
-    missing=needed_subscription(uid)
-    if missing:
-        if request_cache is not None: request_cache[key]=False
-        sub_prompt(uid,missing); return False
+    instant=time.monotonic()
+    with _ACCESS_CACHE_LOCK:
+        item=_ACCESS_CACHE.get(uid)
+        if len(_ACCESS_CACHE)>12000:_ACCESS_CACHE.clear()
+    if item is not None and item[1]>instant:
+        banned=item[0]
+    else:
+        u=user_row(uid)
+        banned=bool(u and u['banned'] and uid!=OWNER_ID)
+        with _ACCESS_CACHE_LOCK:
+            _ACCESS_CACHE[uid]=(banned,instant+_ACCESS_TTL)
+    if banned:
+        if request_cache is not None:request_cache[key]=False
+        safe_send(uid,'🚫 Hisobingiz vaqtincha bloklangan.');return False
+    if check_subscription:
+        missing=needed_subscription(uid)
+        if missing:
+            if request_cache is not None:request_cache[key]=False
+            sub_prompt(uid,missing);return False
     if get('maintenance')=='1' and not is_admin(uid):
-        if request_cache is not None: request_cache[key]=False
-        safe_send(uid,'🛠 Botda texnik xizmat ishlari olib borilmoqda.'); return False
-    if request_cache is not None: request_cache[key]=True
+        if request_cache is not None:request_cache[key]=False
+        safe_send(uid,'🛠 Botda texnik xizmat ishlari olib borilmoqda.');return False
+    if request_cache is not None:request_cache[key]=True
     return True
 
 def stars_menu(uid):
@@ -958,7 +1087,7 @@ def _confirm_purchase_async(uid, data):
         _PURCHASE_CAPACITY.release()
 
 
-def process_purchase(oid):
+def process_purchase(oid,resumed=False):
     if not LIVE_SALES_ENABLED:
         logger.warning('Demo rejim: Fragment API orqali yetkazish bloklandi: %s', oid)
         return
@@ -983,16 +1112,19 @@ def process_purchase(oid):
         # order is NOT re-sent automatically. Money is held for manual review.
         if code in {'INSUFFICIENT_FUNDS','INSUFFICIENT_GAS','INSUFFICIENT_BALANCE',
                     'NOT_ENOUGH_FUNDS','NOT_ENOUGH_BALANCE','LOW_BALANCE'}:
-            finish_order(oid,'waiting_funds',code+': '+reason)
-            safe_send(o['user_id'],
-                      '⏳ <b>Buyurtmangiz yetkazilishi kutilmoqda.</b>\n\n'
-                      'Yetkazib beruvchi hisobida vaqtincha mablag‘ yetarli emas. '
-                      'Pulingiz buyurtma uchun saqlangan. Iltimos, administratorga murojaat qiling.\n'
-                      '⚠️ Shu buyurtmani qayta sotib olmang.')
-            notify_admin(f'🚨 FRAGMENT BALANSI YETARLI EMAS\nBuyurtma: {oid}\n'
-                         f'Xaridor: <code>{o["user_id"]}</code>\n'
-                         'Hamyonni to‘ldirib, yetkazilganini Fragmentda tekshirgach '
-                         'admin paneldan buyurtmani hal qiling.')
+            finish_order(oid,'waiting_funds',('AUTO_RETRY:' if resumed else '')+code+': '+reason)
+            if not resumed:
+                safe_send(o['user_id'],
+                          '⏳ <b>Buyurtmangiz yetkazilishi kutilmoqda.</b>\n\n'
+                          'Yetkazib beruvchi hisobida vaqtincha mablag‘ yetarli emas. '
+                          'Pulingiz buyurtma uchun saqlangan. Iltimos, administratorga murojaat qiling.\n'
+                          '⚠️ Shu buyurtmani qayta sotib olmang.')
+                notify_admin(f'🚨 FRAGMENT BALANSI YETARLI EMAS\nBuyurtma: {oid}\n'
+                             f'Xaridor: <code>{o["user_id"]}</code>\n'
+                             'Hamyon to‘ldirilgach bot uni avtomatik tekshiradi.')
+            else:
+                logger.info('Fragmentda hali mablag‘ yetarli emas: order=%s',oid)
+            _WALLET_RETRY_WAKE.set()
             return
         safe_codes={'INVALID_AMOUNT_MIN','INVALID_AMOUNT_MAX','INVALID_DURATION','IP_NOT_ALLOWED'}
         if code in safe_codes:
@@ -1008,6 +1140,79 @@ def process_purchase(oid):
         finish_order(oid,'review',str(e)[:300])
         safe_send(o['user_id'],f'⚠️ {esc(oid)} bo‘yicha API javobi aniq emas. Ikki marta xarid bo‘lmasligi uchun qayta yuborilmadi. Admin tekshiradi.')
         notify_admin(f'🚨 BUYURTMA NOANIQ NATIJA: {oid} — {esc(str(e))[:220]}')
+
+
+# Automatic fulfilment after Fragment top-up: poll official /wallet/calculate.
+# This API returns Stars max_amount and affordable Premium packages. NEVER
+# blindly retry a request whose status is unknown or already processing.
+def _wallet_supports_order(capabilities, order):
+    if not isinstance(capabilities,dict) or capabilities.get('ok') is not True:
+        return False
+    result=capabilities.get('result')
+    if not isinstance(result,dict):return False
+    if order['kind']=='stars':
+        stars=result.get('stars')
+        if not isinstance(stars,dict):return False
+        try:return int(stars.get('max_amount',0)) >= int(order['qty'])
+        except (TypeError,ValueError):return False
+    if order['kind']=='premium':
+        premium=result.get('premium')
+        packages=premium.get('packages',[]) if isinstance(premium,dict) else []
+        for item in packages if isinstance(packages,list) else []:
+            try:
+                months=item.get('months',item.get('duration',0)) if isinstance(item,dict) else item
+                if int(months)==int(order['qty']):return True
+            except (TypeError,ValueError):continue
+    return False
+
+
+def check_wallet_and_deliver_waiting():
+    if not LIVE_SALES_ENABLED or not read_secret('fragment_key'):
+        return 0
+    cutoff=(datetime.now(timezone.utc)-timedelta(seconds=12)).strftime('%Y-%m-%d %H:%M:%S UTC')
+    backoff=(datetime.now(timezone.utc)-timedelta(seconds=90)).strftime('%Y-%m-%d %H:%M:%S UTC')
+    # First retry is soon after wallet funding; a second insufficient-funds
+    # result is throttled to avoid hammering a wallet that is still empty.
+    with db() as c:
+        waiting=c.execute("SELECT id,kind,qty,status,updated FROM orders WHERE status='waiting_funds' AND updated<? AND (detail NOT LIKE 'AUTO_RETRY:%' OR updated<?) ORDER BY created ASC LIMIT 8",(cutoff,backoff)).fetchall()
+    if not waiting:return 0
+    try:
+        capabilities=fragment('/wallet/calculate',{})
+    except Exception as exc:
+        logger.warning('Fragment wallet check error: %s',type(exc).__name__)
+        return 0
+    attempts=0
+    for order in waiting:
+        if not _wallet_supports_order(capabilities,order):continue
+        # Atomic, idempotent claim: two threads cannot double-fulfil.
+        with db(True, financial=True) as c:
+            claim=c.execute("UPDATE orders SET status='processing',updated=? WHERE id=? AND status='waiting_funds' AND updated<?",
+                            (now(),order['id'],cutoff))
+            claimed=claim.rowcount==1
+        if not claimed:continue
+        attempts+=1
+        logger.info('Fragment mablag‘i tiklandi, eski buyurtma qayta ishlanmoqda: %s',order['id'])
+        # Synchronous here so wallet/calculate can refresh after spending funds.
+        process_purchase(order['id'],resumed=True)
+        break
+    return attempts
+
+
+def _wallet_retry_worker():
+    while True:
+        _WALLET_RETRY_WAKE.wait(_WALLET_RETRY_SECONDS)
+        _WALLET_RETRY_WAKE.clear()
+        try:
+            check_wallet_and_deliver_waiting()
+        except Exception:
+            logger.exception('Avtomatik yetkazish monitorida xatolik')
+
+
+def start_wallet_retry_worker():
+    if _WALLET_RETRY_STARTED.is_set():return
+    _WALLET_RETRY_STARTED.set()
+    threading.Thread(target=_wallet_retry_worker,daemon=True,name='fragment-auto-fulfill').start()
+
 
 
 _ORDER_LABELS = {
@@ -1050,7 +1255,7 @@ def _proof_message(o):
 
 
 def _post_proof_once(o):
-    channel = get('proof_channel').strip()
+    channel = get('proof_channel').strip().split('|',1)[0]
     if not channel or not o or o['status'] not in ('processing','completed'):
         return
     # Claim before sending: no uncertain Telegram retry can produce a duplicate
@@ -1074,7 +1279,7 @@ def _post_proof_once(o):
 
 
 def publish_proof(o):
-    if o and get('proof_channel').strip():
+    if o and proofs_visible():
         _PROOF_POOL.submit(_post_proof_once, o)
 
 
@@ -2042,15 +2247,18 @@ def admin_integrations(uid):
 
 def admin_proof_channel(uid):
     if not is_admin(uid):return
-    channel=get('proof_channel')
-    return safe_send(uid,'📣 <b>Isbotlar kanali</b>\n\n'
-                     f'📡 Kanal: <code>{esc(channel)}</code>' if channel else
-                     '📣 <b>Isbotlar kanali</b>\n\n📡 Hozircha sozlanmagan.\n\n'
-                     'Har bir muvaffaqiyatli yetkazish uchun anonim e’lon yuboriladi. '
-                     'Mijoz o‘zi ruxsat bersa, o‘ziga qilingan xaridda username ham ko‘rinadi.',
-                     keyboard([[('➕ Kanalni o‘rnatish','a:input:proof_channel')],
-                               [('🗑 Kanalni olib tashlash','a:proof:clear')],
-                               [('🧪 Test e’lon','a:proof:test')]]))
+    raw=get('proof_channel').strip()
+    visible=proofs_visible()
+    msg=('📣 <b>Isbotlar kanali</b>\n\n'
+         f'📡 Kanal: <code>{esc(raw or "O‘rnatilmagan")}</code>\n'
+         f'👥 Foydalanuvchi tugmasi: <b>{"✅ YOQILGAN" if visible else "❌ O‘CHIRILGAN"}</b>\n\n'
+         'O‘zgartirganda foydalanuvchilarga yangi klaviatura yuboriladi. '
+         'Yopiq kanal uchun ID|taklif_havolasi formatini ishlating.')
+    return safe_send(uid,msg,keyboard([
+        [('➕ Kanal o‘rnatish','a:input:proof_channel')],
+        [('🟢 / 🔴 User tugmasini yoqish-o‘chirish','a:proof:toggle')],
+        [('🗑 Kanalni o‘chirish','a:proof:clear')],
+        [('🧪 Test e’lon','a:proof:test')]]))
 
 
 def proof_toggle(uid):
@@ -2188,7 +2396,7 @@ def admin_input(uid,k):
       'payment_card_number':'HUMO karta raqamini kiriting (16–19 raqam). To‘lov paytida foydalanuvchiga shu karta chiqadi.',
       'payment_card_name':'HUMO karta egasining ism va familiyasini kiriting.',
       'usd_rate':'1 USD necha so‘m? (Masalan: 12500).',
-      'proof_channel':'Isbotlar kanali @username yoki -100... ID sini yuboring. Bot kanalda admin bo‘lsin.',
+      'proof_channel':'Isbotlar kanali @username yoki yopiq kanal uchun -100...|https://t.me/+taklif formatida yuboring. Bot kanalda admin bo‘lsin.',
       'channel_add':'Kanalni kiriting: @kanal yoki -100... ID. Private kanal uchun: -100...|https://t.me/+invite',
       'channel_del':'O‘chiriladigan kanal @username yoki ID sini kiriting.',
       'admin_add':'Yangi admin Telegram ID sini yuboring.', 'admin_del':'O‘chirish uchun admin ID sini yuboring.',
@@ -2214,14 +2422,21 @@ def handle_admin_input(m,data):
     if not value:return safe_send(uid,'Matn yuboring.')
     try:
         if k=='proof_channel':
-            if not (re.fullmatch(r'@[A-Za-z0-9_]{5,32}',value) or re.fullmatch(r'-100[0-9]{5,20}',value)):
-                raise ValueError('Kanal @username yoki -100... ID formatida bo‘lsin.')
-            chat=bot.get_chat(value)
+            parts=value.split('|',1)
+            channel_ref=parts[0].strip()
+            invite=parts[1].strip() if len(parts)>1 else ''
+            if not (re.fullmatch(r'@[A-Za-z0-9_]{5,32}',channel_ref) or re.fullmatch(r'-100[0-9]{5,20}',channel_ref)):
+                raise ValueError('Kanal @username yoki -100...|https://t.me/+havola formatida bo‘lsin.')
+            if invite and not re.fullmatch(r'https://t\.me/[A-Za-z0-9_+/-]+',invite):
+                raise ValueError('Taklif havolasi https://t.me/... shaklida bo‘lsin.')
+            chat=bot.get_chat(channel_ref)
             member=bot.get_chat_member(chat.id,bot.get_me().id)
             if member.status not in ('administrator','creator'):
                 raise ValueError('Botni isbotlar kanaliga admin qiling.')
-            put('proof_channel',str(chat.id))
+            public=invite or ('https://t.me/'+channel_ref[1:] if channel_ref.startswith('@') else '')
+            put('proof_channel',str(chat.id)+'|'+public)
             clear_state(uid)
+            if proofs_visible():queue_keyboard_refresh()
             return admin_proof_channel(uid)
         if k=='fragment_key':
             set_secret(k,value)
@@ -2591,11 +2806,11 @@ def owner_diagnostics(m):
 def commands(m):
     if m.chat.type!='private':return
     uid=m.from_user.id
-    first_visit=user_row(uid) is None
+    text=m.text or ''
+    match=re.fullmatch(r'/start\s+ref_(\d{1,20})\s*',text.strip()) if text.startswith('/start ') else None
+    first_visit=user_row(uid) is None if match else False
     user_record(m.from_user)
-    if m.text.startswith('/start '):
-        match=re.fullmatch(r'/start\s+ref_(\d{1,20})\s*',m.text.strip())
-        if match:referral_register(uid,int(match.group(1)),first_visit)
+    if match:referral_register(uid,int(match.group(1)),first_visit)
     if m.text.startswith('/id'):
         return safe_send(uid,f'🆔 Telegram ID: <code>{uid}</code>')
     if m.text.startswith('/paysupport'):
@@ -2607,7 +2822,11 @@ def commands(m):
         main_menu(uid);return
     if m.text.startswith('/admin'):
         return admin_menu(uid) if is_admin(uid) else safe_send(uid,'⛔ Admin huquqi yo‘q.')
-    if not check_access(uid):return
+    # Real channel membership is checked only here, not on every menu click.
+    with _SUBSCRIPTION_CACHE_LOCK:
+        for key in list(_SUBSCRIPTION_CACHE):
+            if key[0]==uid:_SUBSCRIPTION_CACHE.pop(key,None)
+    if not check_access(uid,check_subscription=True):return
     main_menu(uid)
 
 
@@ -2724,9 +2943,10 @@ def callbacks(call):
             for cache_key in list(_SUBSCRIPTION_CACHE):
                 if cache_key[0] == uid:
                     del _SUBSCRIPTION_CACHE[cache_key]
-        if check_access(uid):main_menu(uid)
+        if check_access(uid,check_subscription=True):main_menu(uid)
         return
     if s=='home':return main_menu(uid)
+    if s=='u:proof:open':return proof_channel_menu(uid)
     if (s.startswith('a:') or (s.startswith('t:') and s not in ('t:self','t:other'))) and not is_admin(uid):
         return safe_send(uid,'⛔ Ruxsat yo‘q.')
     if s.startswith('a:') and not check_access(uid):return
@@ -2817,16 +3037,28 @@ def callbacks(call):
     if s=='u:proof:toggle':return proof_toggle(uid)
     if s=='u:ledger':return balance_history(uid)
     if s=='u:orders':return my_orders(uid)
+    if s=='a:proof:toggle':
+        if not only_owner(uid):return safe_send(uid,'Faqat bosh admin uchun.')
+        if not proofs_visible() and not get('proof_channel').strip():
+            return safe_send(uid,'Avval isbotlar kanalini kiriting.')
+        new_value='0' if proofs_visible() else '1'
+        if new_value=='1' and not proof_channel_link():
+            return safe_send(uid,'Foydalanuvchi kanalga kira olishi uchun @username yoki taklif havolasini kiriting.')
+        put('proofs_visible',new_value)
+        queue_keyboard_refresh()
+        return admin_proof_channel(uid)
     if s=='a:proof:clear':
         if not only_owner(uid):return safe_send(uid,'Faqat bosh admin uchun.')
         put('proof_channel','')
+        put('proofs_visible','0')
+        queue_keyboard_refresh()
         return admin_proof_channel(uid)
     if s=='a:proof:test':
         if not only_owner(uid):return safe_send(uid,'Faqat bosh admin uchun.')
-        channel=get('proof_channel')
+        channel=get('proof_channel').split('|',1)[0]
         if not channel:return safe_send(uid,'Avval kanalni o‘rnating.')
         try:
-            bot.send_message(int(channel),'🧪 Isbotlar kanali sozlandi. Bu sinov xabari.')
+            bot.send_message(int(channel) if channel.lstrip('-').isdigit() else channel,'🧪 Isbotlar kanali sozlandi. Bu sinov xabari.')
         except Exception as e:return safe_send(uid,'❌ Kanalga yozilmadi: '+esc(type(e).__name__))
         return safe_send(uid,'✅ Sinov e’loni kanalga yuborildi.')
     if s=='a:users:page:0':return admin_users(uid,0)
@@ -2843,7 +3075,7 @@ def callbacks(call):
     if s.startswith('a:input:'):return admin_input(uid,s.split(':',2)[2])
     if s=='a:maintenance':
         if not only_owner(uid):return safe_send(uid,'Faqat bosh admin.')
-        put('maintenance','0' if get('maintenance')=='1' else '1');return admin_settings(uid)
+        put('maintenance','0' if get('maintenance')=='1' else '1');invalidate_access();return admin_settings(uid)
     if s=='a:testfrag':
         try:
             d=fragment('/wallet/balance',{})
@@ -2851,6 +3083,7 @@ def callbacks(call):
         except Exception as e:safe_send(uid,'❌ '+esc(str(e)))
         return
     if s=='a:wallet':
+        _WALLET_RETRY_WAKE.set()
         try:
             d=fragment('/wallet/balance',{})
             safe_send(uid,'💼 <b>Fragment hamyon</b>\n'+esc(json.dumps(d.get('result',d),ensure_ascii=False)[:1900]))
@@ -2880,6 +3113,7 @@ def callbacks(call):
         target=int(s.rsplit(':',1)[1])
         if target in admin_ids():return safe_send(uid,'Adminni bloklab bo‘lmaydi.')
         with db(True) as c:c.execute('UPDATE users SET banned=1-banned WHERE id=?',(target,))
+        invalidate_access(target)
         return user_admin_card(uid,target)
     if s.startswith('a:retryask:'):
         if not only_owner(uid):return safe_send(uid,'Faqat bosh admin uchun.')
@@ -2954,6 +3188,7 @@ def messages(m):
         return main_menu(uid)
     if text=='/cancel':return main_menu(uid)
     if text=='👑 Admin panel' and is_admin(uid):return admin_menu(uid)
+    if text=='📣 Isbotlar':return proof_channel_menu(uid)
     if text in ('⭐ Stars olish','💎 Premium olish','🎁 Gift olish','👥 Referal','💳 Hisob to‘ldirish','💰 Hisobim','📦 Buyurtmalarim','🎧 Yordam'):
         # Five submenus check permissions themselves; avoid double DB/network checks.
         if text in ('💰 Hisobim','📦 Buyurtmalarim','🎧 Yordam') and not check_access(uid):return
@@ -3107,6 +3342,8 @@ def _ensure_bank_monitor():
 
 if 'gunicorn' in os.path.basename(sys.argv[0]).lower():
     start_broadcast_worker()
+    start_menu_refresh_worker()
+    start_wallet_retry_worker()
     maybe_start_bank_listener()  # Gunicorn --workers 1, worker import only; not CLI set-webhook
 
 application = app
