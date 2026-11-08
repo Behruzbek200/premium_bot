@@ -87,6 +87,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger('stars_shop')
 # Webhookdagi haqiqiy Telegram javoblarini xavfsiz diagnostika qilish.
 _WEBHOOK_METRICS = contextvars.ContextVar('webhook_metrics', default=None)
+# Process updates from the same Telegram chat sequentially; different chats parallel.
+_CHAT_PROCESS_LOCKS = [threading.Lock() for _ in range(256)]
 # Tashqi Fragment so'rovi HTTP request threadini to'smaydi.
 _PURCHASE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='fragment-purchase')
 _PURCHASE_CAPACITY = threading.BoundedSemaphore(8)
@@ -167,9 +169,10 @@ class PGConnection:
 
     def execute(self, statement, params=()):
         q = statement.strip()
-        if q.upper() == 'BEGIN IMMEDIATE':
+        if q.upper() in ('BEGIN IMMEDIATE', 'BEGIN WEBHOOK_LOCK'):
             self.cur = self.conn.cursor(cursor_factory=pg_extras.RealDictCursor)
-            self.cur.execute('SELECT pg_advisory_xact_lock(%s)', (34889021171,))
+            key = 34889021171 if q.upper() == 'BEGIN IMMEDIATE' else 34889021172
+            self.cur.execute('SELECT pg_advisory_xact_lock(%s)', (key,))
             return self
         if q.upper().startswith('PRAGMA '):
             return self
@@ -238,11 +241,22 @@ DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg2.IntegrityError)
 
 
 @contextmanager
-def db(write=False):
+def db(write=False, financial=False, webhook_lock=False):
+    """Short PostgreSQL transactions. Global lock ONLY for money or update claims.
+
+    PostgreSQL starts a transaction implicitly on first execute. The old code
+    acquired one advisory lock for EVERY write, blocking /start and buttons
+    behind slow purchases. SQLite retains BEGIN IMMEDIATE for test/demo mode.
+    """
     c = db_open()
     try:
         if write:
-            c.execute('BEGIN IMMEDIATE')
+            if not USE_POSTGRES:
+                c.execute('BEGIN IMMEDIATE')
+            elif financial:
+                c.execute('BEGIN IMMEDIATE')  # serialized financial ledger
+            elif webhook_lock:
+                c.execute('BEGIN WEBHOOK_LOCK')  # separate, short-lived lock
         yield c
         if write or USE_POSTGRES:
             c.commit()
@@ -584,8 +598,8 @@ def admin_menu(uid):
 
 
 def needed_subscription(uid):
-    if is_admin(uid): return []
     channels = channel_rows()
+    if not channels or is_admin(uid): return []
     missing=[]
     for r in channels:
         val=r['val']
@@ -743,7 +757,7 @@ def debit_and_create(uid,data):
         return None, 'Savdo o‘chirilgan. Render ENV: ENABLE_LIVE_SALES=1 qiling.'
     # Bir userning ikkita confirm bosishi bitta orderga aylanadi.
     oid='O'+uuid.uuid4().hex[:12].upper()
-    with db(True) as c:
+    with db(True, financial=True) as c:
         r=c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
         if not r or r['step']!='review_order':return None,'Buyurtma allaqachon yuborilgan yoki bekor qilingan.'
         fresh=json.loads(r['data'])
@@ -766,7 +780,7 @@ def debit_and_create(uid,data):
 
 def finish_order(oid, status, reason=''):
     reward=None
-    with db(True) as c:
+    with db(True, financial=True) as c:
         o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
         if not o or o['status'] not in ('processing','review'):
             return None
@@ -997,7 +1011,7 @@ def _confirm_gift_async(uid):
     finally:
         # If validation failed before debit, make the checkout retryable.
         try:
-            with db(True) as c:
+            with db(True, financial=True) as c:
                 c.execute("UPDATE states SET step='gift_review' WHERE user_id=? AND step='gift_processing'",(uid,))
         except Exception:
             logger.exception('Gift holatini tiklashda xatolik')
@@ -1029,7 +1043,7 @@ def buy_gift(uid):
         logger.warning('Gift preflight: %s',type(exc).__name__)
         return safe_send(uid,'Sovg‘alarni tekshirishda xatolik. Keyinroq urinib ko‘ring.')
     oid='G'+uuid.uuid4().hex[:12].upper()
-    with db(True) as c:
+    with db(True, financial=True) as c:
         st=c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
         if not st or st['step'] not in ('gift_review','gift_processing') or json.loads(st['data'])!=data:
             return safe_send(uid,'Buyurtma allaqachon yuborilgan.')
@@ -1174,7 +1188,7 @@ def referral_menu(uid):
 
 
 def referral_transfer(uid):
-    with db(True) as c:
+    with db(True, financial=True) as c:
         r=c.execute('SELECT referral_balance FROM users WHERE id=?',(uid,)).fetchone()
         bonus=int(r['referral_balance']) if r else 0
         if bonus<=0:return safe_send(uid,'Referal balansda pul yo‘q.')
@@ -1354,7 +1368,7 @@ def create_bank_payment(uid, requested):
     card=get('payment_card_number').strip()
     owner=get('payment_card_name').strip()
     now_ts=int(time.time())
-    with db(True) as c:
+    with db(True, financial=True) as c:
         # To'lov 5 daqiqa amal qiladi; qo'shimcha 120 soniya kechikkan
         # xabar kelishiga vaqt beramiz, keyin muddati o'tgan summani bo'shatamiz.
         # Kechikib kelgan haqiqiy to'lov admin tomonidan tekshirilishi kerak.
@@ -1398,7 +1412,7 @@ def process_bank_notice(sender_id, message_id, text, event_timestamp):
     notice_ref = record['tx_ref'] or f'TG:{sender_id}:{message_id}'
     event_ts=float(event_timestamp)
     pid=None
-    with db(True) as c:
+    with db(True, financial=True) as c:
         matching=c.execute("SELECT * FROM payments WHERE status='pending' AND amount=? AND provider_id LIKE 'BANK:%' AND expires_at >= ?",(record['amount'],int(event_ts))).fetchall()
         matching=[p for p in matching if 0 <= event_ts-datetime.strptime(p['created'],'%Y-%m-%d %H:%M:%S UTC').replace(tzinfo=timezone.utc).timestamp()<=300]
         if len(matching)!=1:return 'ambiguous'
@@ -1427,7 +1441,7 @@ def process_bank_notice(sender_id, message_id, text, event_timestamp):
 
 def approve_bank_payment(uid, pid):
     if uid!=OWNER_ID:return 'Ruxsat yo‘q.'
-    with db(True) as c:
+    with db(True, financial=True) as c:
         p=c.execute('SELECT * FROM payments WHERE id=?',(pid,)).fetchone()
         if not p or p['status']!='pending' or not str(p['provider_id']).startswith('BANK:'):
             return 'Pending HUMO to‘lov topilmadi.'
@@ -1616,7 +1630,7 @@ def verify_payment(pid):
 
 
 def cancel_pending_payment(uid,pid):
-    with db(True) as c:
+    with db(True, financial=True) as c:
         p=c.execute('SELECT * FROM payments WHERE id=?',(pid,)).fetchone()
         if not p or p['user_id']!=uid:
             return safe_send(uid,'⛔ Bu to‘lovga ruxsat yo‘q.')
@@ -1628,7 +1642,7 @@ def cancel_pending_payment(uid,pid):
 
 def payment_sweep(limit=3):
     # Expiration is conservative: two-minute buffer for late bank notifications.
-    with db(True) as c:
+    with db(True, financial=True) as c:
         n=c.execute("UPDATE payments SET status='expired',updated=? WHERE status='pending' AND provider_id LIKE 'BANK:%' AND expires_at < ?",(now(),int(time.time())-120))
         return n.rowcount
 
@@ -1947,7 +1961,7 @@ def handle_admin_adjust(m,data):
     delta=int(s)
     if delta==0 or abs(delta)>10000000:return safe_send(uid,'Bir urinishda ko‘pi bilan 10 mln so‘m.')
     ref='A'+uuid.uuid4().hex[:12]
-    with db(True) as c:
+    with db(True, financial=True) as c:
         r=c.execute('SELECT balance FROM users WHERE id=?',(target,)).fetchone()
         if not r:return safe_send(uid,'Foydalanuvchi topilmadi.')
         if r['balance']+delta<0:return safe_send(uid,'❌ Balans manfiy bo‘lib qoladi.')
@@ -2054,7 +2068,7 @@ def telegram_webhook(token):
     except (KeyError,ValueError,TypeError):
         return jsonify({'ok':False,'error':'invalid update'}),400
     # Xuddi shu update Telegram tomonidan takror yuborilsa, ikki marta bajarmaymiz.
-    with db(True) as c:
+    with db(True, webhook_lock=True) as c:
         row=c.execute('SELECT status,arrived FROM telegram_updates WHERE update_id=?',(update_id,)).fetchone()
         if row:
             if row['status']=='done':
@@ -2082,10 +2096,18 @@ def telegram_webhook(token):
     token_metrics = _WEBHOOK_METRICS.set(metrics)
     logger.info('Webhook IN update=%s kind=%s', update_id, kind)
     try:
-        bot.process_new_updates([update])
+        chat_uid = 0
+        if isinstance(raw.get('message'), dict):
+            chat_uid = int(raw['message'].get('chat', {}).get('id') or 0)
+        elif isinstance(raw.get('callback_query'), dict):
+            chat_uid = int(raw['callback_query'].get('from', {}).get('id') or 0)
+        elif isinstance(raw.get('pre_checkout_query'), dict):
+            chat_uid = int(raw['pre_checkout_query'].get('from', {}).get('id') or 0)
+        with _CHAT_PROCESS_LOCKS[chat_uid % len(_CHAT_PROCESS_LOCKS)]:
+            bot.process_new_updates([update])
     except Exception:
         logger.exception('Telegram webhook update failed: %s',update_id)
-        with db(True) as c:
+        with db(True, webhook_lock=True) as c:
             c.execute("UPDATE telegram_updates SET status='failed' WHERE update_id=?",(update_id,))
         # Fail-closed: API buyurtma bajarilgan-bajarilmagan noma'lum bo'lishi mumkin.
         return jsonify({'ok':False,'error':'update failed; manual review'}),500
@@ -2094,14 +2116,23 @@ def telegram_webhook(token):
         logger.info('Webhook OUT update=%s kind=%s send_ok=%s send_failed=%s duration_ms=%s',
                     update_id, kind, metrics['sent'], metrics['failed'],
                     int((time.monotonic()-started)*1000))
-    # Retry only idempotent informational commands if Telegram API did not
-    # accept their message. Do not replay payment or order callbacks.
-    msg_text = str((raw.get('message') or {}).get('text') or '').split(' ', 1)[0].split('@',1)[0]
-    if metrics['failed'] and msg_text in ('/start','/id','/menu','/admin','/terms'):
-        with db(True) as c:
+    # Read-only menu requests should not be acknowledged as delivered if no
+    # Telegram message was accepted; they may safely be retried. Purchase and
+    # payment callbacks are NEVER auto-replayed on uncertain outcomes.
+    raw_text = str((raw.get('message') or {}).get('text') or '').strip()
+    cmd = raw_text.split(' ', 1)[0].split('@', 1)[0]
+    read_only_commands = {'/start','/id','/menu','/admin','/terms','/paysupport'}
+    menu_texts = {'⭐ Stars olish','💎 Premium olish','👥 Referal','🎁 Gift olish',
+                  '💰 Hisobim','💳 Hisob to‘ldirish','📦 Buyurtmalarim','🎧 Yordam',
+                  '🏠 User menyu','🏠 Bosh menyu','⬅️ Orqaga'}
+    should_reply = cmd in read_only_commands or raw_text in menu_texts
+    if should_reply and (metrics['failed'] or metrics['sent'] == 0):
+        logger.warning('Bot menu reply unavailable: update=%s text=%s sent=%s failed=%s',
+                       update_id, raw_text[:32], metrics['sent'], metrics['failed'])
+        with db(True, webhook_lock=True) as c:
             c.execute("UPDATE telegram_updates SET status='failed' WHERE update_id=?",(update_id,))
         return jsonify({'ok':False,'retry':'sendMessage unavailable'}),503
-    with db(True) as c:
+    with db(True, webhook_lock=True) as c:
         c.execute("UPDATE telegram_updates SET status='done' WHERE update_id=?",(update_id,))
         # Cheklanmagan ko'payishni oldini olish (so'nggi 20 ming update saqlanadi).
         if update_id % 256 == 0:
@@ -2136,7 +2167,7 @@ def owner_stars_payment(m):
             or int(payload[2])!=int(sp.total_amount)):
             return
         charge=sp.telegram_payment_charge_id
-        with db(True) as c:
+        with db(True, financial=True) as c:
             new=c.execute('INSERT OR IGNORE INTO bot_star_deposits(charge_id,user_id,stars,created) VALUES(?,?,?,?)',
                           (charge,OWNER_ID,sp.total_amount,now()))
         if new.rowcount:
@@ -2488,7 +2519,8 @@ def messages(m):
     if text=='/cancel':return main_menu(uid)
     if text=='👑 Admin panel' and is_admin(uid):return admin_menu(uid)
     if text in ('⭐ Stars olish','💎 Premium olish','🎁 Gift olish','👥 Referal','💳 Hisob to‘ldirish','💰 Hisobim','📦 Buyurtmalarim','🎧 Yordam'):
-        if not check_access(uid):return
+        # Five submenus check permissions themselves; avoid double DB/network checks.
+        if text in ('💰 Hisobim','📦 Buyurtmalarim','🎧 Yordam') and not check_access(uid):return
         clear_state(uid)
         if text=='⭐ Stars olish':return stars_menu(uid)
         if text=='💎 Premium olish':return premium_menu(uid)
@@ -2607,7 +2639,7 @@ def setup_telegram_webhook(public_url):
     put('public_url',public_url)
     webhook_url=public_url+'/telegram/'+get('telegram_webhook_path')
     result=bot.set_webhook(url=webhook_url, secret_token=get('telegram_header_secret'),
-                           allowed_updates=['message','callback_query','pre_checkout_query'], max_connections=1,
+                           allowed_updates=['message','callback_query','pre_checkout_query'], max_connections=8,
                            drop_pending_updates=False)
     print('Webhook o‘rnatildi:',result)
     if not result:
@@ -2655,7 +2687,7 @@ def start_render():
         raise SystemExit('PORT noto‘g‘ri')
     os.execvp('gunicorn', [
         'gunicorn', '--bind', '0.0.0.0:' + port,
-        '--workers', '1', '--threads', '4', '--timeout', '120',
+        '--workers', '1', '--threads', '8', '--timeout', '120',
         # Log HTTP status/latency without exposing the secret webhook path.
         '--access-logfile', '-', '--access-logformat', '%(h)s %(m)s %(s)s %(L)s',
         '--error-logfile', '-', 'bot:app'
