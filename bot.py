@@ -24,6 +24,8 @@ import hmac
 import hashlib
 import secrets
 import logging
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 import psycopg2
 from psycopg2 import extras as pg_extras
@@ -72,7 +74,7 @@ HUMO_AUTO_CREDIT = os.getenv('HUMO_AUTO_CREDIT','1') == '1'
 HUMO_LISTENER_STARTED = threading.Event()
 HUMO_LISTENER_CONNECTED = threading.Event()
 
-REQUEST_TIMEOUT = (4, 15)
+REQUEST_TIMEOUT = (3, 12)
 
 if not BOT_TOKEN or OWNER_ID <= 0:
     raise SystemExit('Render Environment: BOT_TOKEN va OWNER_ID ni kiriting!')
@@ -83,6 +85,31 @@ if LIVE_SALES_ENABLED and not USE_POSTGRES:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('stars_shop')
+# Webhookdagi haqiqiy Telegram javoblarini xavfsiz diagnostika qilish.
+_WEBHOOK_METRICS = contextvars.ContextVar('webhook_metrics', default=None)
+# Tashqi Fragment so'rovi HTTP request threadini to'smaydi.
+_PURCHASE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='fragment-purchase')
+_PURCHASE_CAPACITY = threading.BoundedSemaphore(8)
+
+# Qisqa muddatli sozlamalar keshi, global/maxfiy sirlarni log qilmaymiz.
+_SETTING_CACHE = {}
+_SETTING_CACHE_LOCK = threading.Lock()
+_SETTINGS_TTL = 12.0
+_USER_TOUCH_CACHE = {}
+_USER_TOUCH_LOCK = threading.Lock()
+_CHANNEL_CACHE = {'expires': 0.0, 'rows': ()}
+_CHANNEL_CACHE_LOCK = threading.Lock()
+_BOT_USERNAME = None
+_HTTP_LOCAL = threading.local()
+
+
+def http_session():
+    s = getattr(_HTTP_LOCAL, 'session', None)
+    if s is None:
+        s = requests.Session()
+        _HTTP_LOCAL.session = s
+    return s
+
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False, parse_mode='HTML')
 app = Flask(__name__)
 
@@ -117,7 +144,7 @@ def _pg_pool():
     with _PG_POOL_LOCK:
         if _PG_POOL is None or _PG_POOL_PID != pid:
             _PG_POOL = ThreadedConnectionPool(
-                minconn=1, maxconn=8, dsn=DATABASE_URL,
+                minconn=1, maxconn=12, dsn=DATABASE_URL,
                 connect_timeout=12, application_name='stars-premium-gift-shop'
             )
             _PG_POOL_PID = pid
@@ -337,14 +364,49 @@ def setup_db():
 
 
 def get(k, default=''):
+    instant = time.monotonic()
+    with _SETTING_CACHE_LOCK:
+        cached = _SETTING_CACHE.get(k)
+        if cached and cached[1] > instant:
+            return cached[0] if cached[0] is not None else default
     with db() as c:
         r = c.execute('SELECT val FROM settings WHERE key=?',(k,)).fetchone()
-        return r['val'] if r else default
+    value = r['val'] if r else None
+    with _SETTING_CACHE_LOCK:
+        if len(_SETTING_CACHE) > 512:
+            _SETTING_CACHE.clear()
+        _SETTING_CACHE[k] = (value, instant + _SETTINGS_TTL)
+    return value if value is not None else default
 
 
 def put(k, v):
     with db(True) as c:
         c.execute('INSERT INTO settings(key,val) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET val=excluded.val',(k,str(v)))
+    with _SETTING_CACHE_LOCK:
+        _SETTING_CACHE[k] = (str(v), time.monotonic() + _SETTINGS_TTL)
+    if str(k).startswith('channel_'):
+        with _CHANNEL_CACHE_LOCK:
+            _CHANNEL_CACHE['expires'] = 0.0
+
+
+def channel_rows():
+    instant = time.monotonic()
+    with _CHANNEL_CACHE_LOCK:
+        if _CHANNEL_CACHE['expires'] > instant:
+            return list(_CHANNEL_CACHE['rows'])
+    with db() as c:
+        rows = c.execute("SELECT key,val FROM settings WHERE key LIKE 'channel_%' ORDER BY key").fetchall()
+    with _CHANNEL_CACHE_LOCK:
+        _CHANNEL_CACHE['rows'] = tuple(rows)
+        _CHANNEL_CACHE['expires'] = time.monotonic() + _SETTINGS_TTL
+    return rows
+
+
+def bot_username():
+    global _BOT_USERNAME
+    if not _BOT_USERNAME:
+        _BOT_USERNAME = bot.get_me().username
+    return _BOT_USERNAME
 
 
 def param(k, fallback=0):
@@ -429,18 +491,42 @@ def notify_admin(text, markup=None):
 
 
 def safe_send(uid, text, markup=None):
-    try: return bot.send_message(uid,text,reply_markup=markup,disable_web_page_preview=True)
-    except Exception as e:
-        logger.warning('Xabar yuborilmadi (%s): %s',uid,type(e).__name__)
+    # Old version silently returned None, so webhook returned 200 although
+    # Telegram rejected the bot's reply (400/403/429/etc).
+    metrics = _WEBHOOK_METRICS.get()
+    try:
+        result = bot.send_message(uid, text, reply_markup=markup,
+                                  disable_web_page_preview=True)
+        if metrics is not None:
+            metrics['sent'] += 1
+        return result
+    except Exception as exc:
+        if metrics is not None:
+            metrics['failed'] += 1
+        details = str(exc).replace(BOT_TOKEN, '[REDACTED]')[:350]
+        logger.error('Telegram sendMessage FAILED chat=%s type=%s details=%s',
+                     uid, type(exc).__name__, details)
         return None
 
 
 def user_record(u):
     if not u: return
+    uid = u.id
+    name, username = (u.first_name or '')[:100], (u.username or '')[:100]
+    stamp = time.monotonic()
+    with _USER_TOUCH_LOCK:
+        old = _USER_TOUCH_CACHE.get(uid)
+        if old and old[0] == name and old[1] == username and old[2] > stamp:
+            return
     with db(True) as c:
         c.execute('''INSERT INTO users(id,name,username,created) VALUES(?,?,?,?)
-          ON CONFLICT(id) DO UPDATE SET name=excluded.name,username=excluded.username''',
-                  (u.id, (u.first_name or '')[:100],(u.username or '')[:100],now()))
+          ON CONFLICT(id) DO UPDATE SET name=excluded.name,username=excluded.username
+          WHERE users.name IS DISTINCT FROM excluded.name OR users.username IS DISTINCT FROM excluded.username''',
+                  (uid, name, username,now()))
+    with _USER_TOUCH_LOCK:
+        if len(_USER_TOUCH_CACHE) > 8192:
+            _USER_TOUCH_CACHE.clear()
+        _USER_TOUCH_CACHE[uid] = (name, username, time.monotonic()+30.0)
 
 
 def user_row(uid):
@@ -499,7 +585,7 @@ def admin_menu(uid):
 
 def needed_subscription(uid):
     if is_admin(uid): return []
-    with db() as c: channels=c.execute("SELECT key,val FROM settings WHERE key LIKE 'channel_%'").fetchall()
+    channels = channel_rows()
     missing=[]
     for r in channels:
         val=r['val']
@@ -616,7 +702,7 @@ def fragment(path,payload):
     key=read_secret('fragment_key')
     if not key: raise RuntimeError('Fragment API Key kiritilmagan')
     try:
-        res=requests.post(FRAGMENT_BASE+path,json=payload,
+        res=http_session().post(FRAGMENT_BASE+path,json=payload,
             headers={'X-API-Key':key,'Content-Type':'application/json'},timeout=REQUEST_TIMEOUT)
         data=res.json()
     except requests.RequestException as e:
@@ -698,6 +784,48 @@ def finish_order(oid, status, reason=''):
     return o
 
 
+def _confirm_purchase_async(uid, data):
+    """No request thread waiting for Fragment /pricing and /buy.
+
+    A 1-user state transition prevents duplicate confirm callbacks. Monetary
+    debit and order creation remain atomic. An uncertain delivery is NEVER
+    retried blindly: existing process_purchase marks it review instead.
+    """
+    try:
+        ok, reason = safe_price_check(data['kind'], data['qty'], data['total'])
+        if not ok:
+            with db(True) as c:
+                st = c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
+                if st and st['step']=='checking_price' and json.loads(st['data'])==data:
+                    c.execute("UPDATE states SET step='review_order' WHERE user_id=?",(uid,))
+            notify_admin('⚠️ Tannarx tekshiruvi: '+esc(reason))
+            safe_send(uid,'⚠️ Hozir buyurtma qabul qilinmadi. Admin narxlarni tekshiradi.\n'+esc(reason)[:180])
+            return
+        with db(True) as c:
+            st = c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
+            if not st or st['step']!='checking_price' or json.loads(st['data'])!=data:
+                logger.info('Xarid narx tekshiruvi bekor qilingan user=%s',uid)
+                return
+            c.execute("UPDATE states SET step='review_order' WHERE user_id=?",(uid,))
+        oid, msg = debit_and_create(uid, data)
+        if not oid:
+            safe_send(uid,'❌ '+esc(msg))
+            return
+        safe_send(uid,f'⏳ Buyurtma #{esc(oid)} qabul qilindi. Yetkazish boshlandi...')
+        process_purchase(oid)
+    except Exception as exc:
+        logger.exception('Xaridni tekshirishda xatolik, user=%s',uid)
+        # If no debit occurred, allow the user to retry. Once an order has
+        # been created, never repeat an uncertain Fragment request automatically.
+        with db(True) as c:
+            st = c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
+            if st and st['step']=='checking_price' and json.loads(st['data'])==data:
+                c.execute("UPDATE states SET step='review_order' WHERE user_id=?",(uid,))
+        safe_send(uid,'⚠️ Xarid tekshiruvi vaqtincha ishlamadi. /start orqali qayta urinib ko‘ring.')
+    finally:
+        _PURCHASE_CAPACITY.release()
+
+
 def process_purchase(oid):
     if not LIVE_SALES_ENABLED:
         logger.warning('Demo rejim: Fragment API orqali yetkazish bloklandi: %s', oid)
@@ -762,7 +890,7 @@ def my_orders(uid):
 def tg_api(method, payload=None):
     """Bot API raw call; avoids a separate pyTelegramBotAPI-specific gift implementation."""
     try:
-        r=requests.post('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,
+        r=http_session().post('https://api.telegram.org/bot'+BOT_TOKEN+'/'+method,
                         json=payload or {}, timeout=REQUEST_TIMEOUT)
     except requests.RequestException:
         # Never log the raw RequestException URL because it contains BOT_TOKEN.
@@ -855,10 +983,31 @@ def gift_bot_stars():
     return int(tg_api('getMyStarBalance').get('amount',0))
 
 
+def _confirm_gift_async(uid):
+    """Gift API preflight and delivery off the webhook request thread.
+
+    Once money is debited, gift handling preserves the existing
+    no-auto-retry/review semantics for uncertain Telegram API outcomes.
+    """
+    try:
+        buy_gift(uid)
+    except Exception:
+        logger.exception('Gift fon ishchi xatoligi, user=%s',uid)
+        safe_send(uid,'⚠️ Sovg‘ani tekshirishda xato. Buyurtmalarim bo‘limini ko‘ring.')
+    finally:
+        # If validation failed before debit, make the checkout retryable.
+        try:
+            with db(True) as c:
+                c.execute("UPDATE states SET step='gift_review' WHERE user_id=? AND step='gift_processing'",(uid,))
+        except Exception:
+            logger.exception('Gift holatini tiklashda xatolik')
+        _PURCHASE_CAPACITY.release()
+
+
 def buy_gift(uid):
     if not LIVE_SALES_ENABLED:return safe_send(uid,'Xarid vaqtincha mavjud emas.')
     step,data=state(uid)
-    if step!='gift_review':return safe_send(uid,'Buyurtma eskirgan. Sovg‘ani qayta tanlang.')
+    if step not in ('gift_review','gift_processing'):return safe_send(uid,'Buyurtma eskirgan. Sovg‘ani qayta tanlang.')
     g=gift_row(data['slot'])
     if (not g or not g['enabled'] or g['price']<=0 or g['price']!=data['price']
             or g['gift_id']!=data['gift_id']):
@@ -882,7 +1031,7 @@ def buy_gift(uid):
     oid='G'+uuid.uuid4().hex[:12].upper()
     with db(True) as c:
         st=c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
-        if not st or st['step']!='gift_review' or json.loads(st['data'])!=data:
+        if not st or st['step'] not in ('gift_review','gift_processing') or json.loads(st['data'])!=data:
             return safe_send(uid,'Buyurtma allaqachon yuborilgan.')
         updated=c.execute('UPDATE users SET balance=balance-? WHERE id=? AND balance>=?',
                           (g['price'],uid,g['price']))
@@ -1005,7 +1154,7 @@ def award_referral_in_tx(c,order):
 
 def referral_menu(uid):
     if not check_access(uid):return
-    try:uname=bot.get_me().username
+    try:uname=bot_username()
     except Exception:return safe_send(uid,'Havolani olishda xatolik. Keyinroq urinib ko‘ring.')
     with db() as c:
         count=c.execute('SELECT COUNT(*) n FROM referrals WHERE referrer_id=?',(uid,)).fetchone()['n']
@@ -1348,12 +1497,20 @@ def telethon_listener_worker():
         time.sleep(15)
 
 
+_HUMO_CHECK_NEXT = 0.0
+_HUMO_CHECK_LOCK = threading.Lock()
+
 def maybe_start_bank_listener():
     # Monitoring may connect while live sales is OFF: /bankstatus can be
     # checked without accepting actual money. Crediting itself remains gated.
-    if PAYMENT_PROVIDER != 'bank_session' or not bank_configured():return
-    if HUMO_LISTENER_STARTED.is_set():return
-    HUMO_LISTENER_STARTED.set()
+    global _HUMO_CHECK_NEXT
+    if PAYMENT_PROVIDER != 'bank_session' or HUMO_LISTENER_STARTED.is_set():return
+    with _HUMO_CHECK_LOCK:
+        if HUMO_LISTENER_STARTED.is_set() or time.monotonic() < _HUMO_CHECK_NEXT:
+            return
+        _HUMO_CHECK_NEXT = time.monotonic()+20.0
+        if not bank_configured():return
+        HUMO_LISTENER_STARTED.set()
     threading.Thread(target=telethon_listener_worker,name='humo-listener',daemon=True).start()
 
 
@@ -1600,7 +1757,7 @@ def admin_integrations(uid):
 
 
 def admin_channels(uid):
-    with db() as c:chs=c.execute("SELECT * FROM settings WHERE key LIKE 'channel_%' ORDER BY key").fetchall()
+    chs = channel_rows()
     lines='\n'.join(esc(x['val'].split('|')[0]) for x in chs)
     safe_send(uid,'📣 <b>Majburiy obuna kanallari</b>\n'+(lines or 'Hozircha yo‘q'),
               keyboard([[('➕ Kanal qo‘shish','a:input:channel_add'),('🗑 Kanal o‘chirish','a:input:channel_del')]]))
@@ -1687,6 +1844,7 @@ def admin_input(uid,k):
 
 
 def handle_admin_input(m,data):
+    global _HUMO_CHECK_NEXT
     uid=m.from_user.id
     k=data.get('key','')
     if not is_admin(uid):return
@@ -1705,10 +1863,12 @@ def handle_admin_input(m,data):
             if not 16 <= len(cardval) <= 19 or not value.replace(' ','').isdigit():
                 raise ValueError('Karta raqami 16–19 raqamdan iborat bo‘lsin.')
             put(k,cardval)
+            _HUMO_CHECK_NEXT = 0.0
         elif k=='payment_card_name':
             if not 3<=len(value)<=120 or not re.fullmatch(r"[\w .\-’'ʻҒғЎўҚқҲҳЁёА-Яа-я]+",value,re.UNICODE):
                 raise ValueError('Karta egasining ismini to‘g‘ri yuboring (3–120 belgi).')
             put(k,value)
+            _HUMO_CHECK_NEXT = 0.0
         elif k=='public_url':
             if not re.fullmatch(r'https://[a-zA-Z0-9.-]+(?::\d{2,5})?',value.rstrip('/')):
                 raise ValueError('Masalan: https://shop.onrender.com')
@@ -1735,6 +1895,8 @@ def handle_admin_input(m,data):
                     except Exception:pass
                 for key in found:c.execute('DELETE FROM settings WHERE key=?',(key,))
             if not found:raise ValueError('Kanal topilmadi.')
+            with _CHANNEL_CACHE_LOCK:
+                _CHANNEL_CACHE['expires'] = 0.0
         elif k in ('admin_add','admin_del'):
             n=int(value)
             if n<=0 or n==OWNER_ID:raise ValueError('Bosh adminni o‘zgartirish mumkin emas.')
@@ -1797,6 +1959,33 @@ def handle_admin_adjust(m,data):
     safe_send(target,f'💳 Balansingiz administrator tomonidan {money(abs(delta))} ga {"to‘ldirildi" if delta>0 else "kamaytirildi"}.')
 
 
+_BCAST_WAKE = threading.Event()
+_BCAST_STARTED = threading.Event()
+
+
+def _broadcast_worker():
+    while True:
+        _BCAST_WAKE.wait(timeout=50)
+        _BCAST_WAKE.clear()
+        try:
+            while True:
+                sent = drain_broadcast(limit=8)
+                if sent == 0:
+                    break
+                time.sleep(0.6)
+        except Exception:
+            logger.exception('Broadcast background worker xatoligi')
+            time.sleep(5)
+
+
+def start_broadcast_worker():
+    if _BCAST_STARTED.is_set():
+        return
+    _BCAST_STARTED.set()
+    threading.Thread(target=_broadcast_worker, daemon=True, name='broadcast-worker').start()
+    _BCAST_WAKE.set()  # finish pending rows left from before a restart
+
+
 def send_broadcast(m):
     """WSGI worker ichida background thread emas, saqlanadigan yuborish navbati."""
     uid=m.from_user.id
@@ -1808,8 +1997,8 @@ def send_broadcast(m):
         c.executemany('INSERT INTO broadcast_queue(job_id,from_chat,source_message,target_id,status,created) VALUES(?,?,?,?,?,?)',
                       [(job_id,uid,m.message_id,i,'pending',now()) for i in ids])
     safe_send(uid,f'📢 Xabar {len(ids)} foydalanuvchi navbatiga qo‘shildi.\n'
-                  '⏱ Avval bir nechtasiga yuboriladi, qolgani monitoring URL orqali davom etadi.')
-    drain_broadcast(limit=3)
+                  '⏱ Qolgan xabarlar server faol turganida avtomatik yuboriladi.')
+    _BCAST_WAKE.set()
 
 
 def drain_broadcast(limit=5):
@@ -1887,6 +2076,11 @@ def telegram_webhook(token):
         else:
             c.execute('INSERT INTO telegram_updates(update_id,status,arrived) VALUES(?,?,?)',
                       (update_id,'processing',now()))
+    started = time.monotonic()
+    metrics = {'sent': 0, 'failed': 0}
+    kind = next((k for k in ('message','callback_query','pre_checkout_query') if k in raw), 'other')
+    token_metrics = _WEBHOOK_METRICS.set(metrics)
+    logger.info('Webhook IN update=%s kind=%s', update_id, kind)
     try:
         bot.process_new_updates([update])
     except Exception:
@@ -1895,10 +2089,23 @@ def telegram_webhook(token):
             c.execute("UPDATE telegram_updates SET status='failed' WHERE update_id=?",(update_id,))
         # Fail-closed: API buyurtma bajarilgan-bajarilmagan noma'lum bo'lishi mumkin.
         return jsonify({'ok':False,'error':'update failed; manual review'}),500
+    finally:
+        _WEBHOOK_METRICS.reset(token_metrics)
+        logger.info('Webhook OUT update=%s kind=%s send_ok=%s send_failed=%s duration_ms=%s',
+                    update_id, kind, metrics['sent'], metrics['failed'],
+                    int((time.monotonic()-started)*1000))
+    # Retry only idempotent informational commands if Telegram API did not
+    # accept their message. Do not replay payment or order callbacks.
+    msg_text = str((raw.get('message') or {}).get('text') or '').split(' ', 1)[0].split('@',1)[0]
+    if metrics['failed'] and msg_text in ('/start','/id','/menu','/admin','/terms'):
+        with db(True) as c:
+            c.execute("UPDATE telegram_updates SET status='failed' WHERE update_id=?",(update_id,))
+        return jsonify({'ok':False,'retry':'sendMessage unavailable'}),503
     with db(True) as c:
         c.execute("UPDATE telegram_updates SET status='done' WHERE update_id=?",(update_id,))
         # Cheklanmagan ko'payishni oldini olish (so'nggi 20 ming update saqlanadi).
-        c.execute('DELETE FROM telegram_updates WHERE update_id < (SELECT COALESCE(MAX(update_id),0)-20000 FROM telegram_updates)')
+        if update_id % 256 == 0:
+            c.execute('DELETE FROM telegram_updates WHERE update_id < (SELECT COALESCE(MAX(update_id),0)-20000 FROM telegram_updates)')
     return jsonify({'ok':True})
 
 
@@ -1948,7 +2155,38 @@ def bank_commands(m):
     if len(parts)!=2:return safe_send(m.chat.id,'Format: /bankapprove BXXXXXXXXXXXXXXX')
     return safe_send(m.chat.id,esc(approve_bank_payment(m.from_user.id,parts[1])))
 
-@bot.message_handler(commands=['start','menu','admin','cancel','id'])
+@bot.message_handler(commands=['diag'])
+def owner_diagnostics(m):
+    """Bosh admin uchun webhook va PostgreSQL holatini bitta xabarda ko'rsatadi."""
+    if m.chat.type != 'private' or m.from_user.id != OWNER_ID:
+        return
+    started = time.monotonic()
+    try:
+        with db() as c:
+            c.execute('SELECT 1').fetchone()
+        db_line = f'✅ Ulandi ({(time.monotonic() - started)*1000:.0f} ms)'
+    except Exception as exc:
+        db_line = f'❌ {esc(type(exc).__name__)}'
+        logger.exception('Owner /diag: PostgreSQL tekshiruv')
+    try:
+        info = bot.get_webhook_info()
+        webhook_line = ('✅ Ulangan' if info.url else '❌ Webhook bo‘sh')
+        webhook_line += f'\n📨 Navbat: {info.pending_update_count}'
+        if info.last_error_message:
+            webhook_line += '\n⚠️ Oxirgi xato: '+esc(info.last_error_message)[:300]
+    except Exception as exc:
+        webhook_line = f'❌ {esc(type(exc).__name__)}'
+        logger.exception('Owner /diag: getWebhookInfo tekshiruv')
+    safe_send(m.chat.id,
+              '🔧 <b>Bot diagnostikasi</b>\n\n'
+              '🗄 PostgreSQL: '+db_line+'\n'
+              '🌐 Webhook: '+webhook_line+'\n'
+              '🏦 HUMO monitor: '+('✅ ulangan' if HUMO_LISTENER_CONNECTED.is_set() else '❌ ulanmagan')+'\n'
+              '🛒 Savdo rejimi: '+('YOQIQ' if LIVE_SALES_ENABLED else 'O‘CHIQ')+'\n\n'
+              '⚠️ Bu faqat texnik holat; haqiqiy to‘lov sinovi emas.')
+
+
+@bot.message_handler(commands=['start','menu','admin','cancel','id','paysupport','terms'])
 def commands(m):
     if m.chat.type!='private':return
     uid=m.from_user.id
@@ -1959,6 +2197,11 @@ def commands(m):
         if match:referral_register(uid,int(match.group(1)),first_visit)
     if m.text.startswith('/id'):
         return safe_send(uid,f'🆔 Telegram ID: <code>{uid}</code>')
+    if m.text.startswith('/paysupport'):
+        set_state(uid,'user_support')
+        return safe_send(uid,'🎧 To‘lov yoki buyurtma yuzasidan murojaatingizni yuboring. Pul o‘tkazgan bo‘lsangiz to‘lov vaqti va summasini yozing; maxfiy kod yoki parolni yubormang.')
+    if m.text.startswith('/terms'):
+        return safe_send(uid,'📜 <b>Xizmat ma’lumotlari</b>\nNarx va mavjudlikni buyurtmadan oldin tekshiring.\nTo‘lovni tasdiqlashdan oldin karta raqami va summani solishtiring.\nTashqi API ishlamay qolsa, buyurtma tekshiruvga olinadi.\nSavollar uchun /paysupport.')
     if m.text.startswith('/cancel'):
         main_menu(uid);return
     if m.text.startswith('/admin'):
@@ -1995,10 +2238,31 @@ def callbacks(call):
                              'Do‘stingiz sovg‘ani olishi uchun avval botni /start orqali ochgan bo‘lishi kerak.')
     if s=='g:confirm':
         if not check_access(uid):return
-        return buy_gift(uid)
+        if not LIVE_SALES_ENABLED:
+            return safe_send(uid,'Sovg‘a xaridi vaqtincha o‘chirilgan.')
+        if not _PURCHASE_CAPACITY.acquire(blocking=False):
+            return safe_send(uid,'⏳ Xaridlar navbati band. Birozdan keyin urining.')
+        submitted = False
+        try:
+            with db(True) as c:
+                st = c.execute('SELECT step FROM states WHERE user_id=?',(uid,)).fetchone()
+                if not st or st['step']!='gift_review':
+                    return safe_send(uid,'⏳ Sovg‘a allaqachon tekshirilmoqda yoki bajarilgan.')
+                c.execute("UPDATE states SET step='gift_processing' WHERE user_id=?",(uid,))
+            _PURCHASE_POOL.submit(_confirm_gift_async,uid)
+            submitted = True
+            return safe_send(uid,'🎁 Sovg‘a tekshirilmoqda. Tasdiqlashni qayta bosmang.')
+        except Exception:
+            logger.exception('Gift xaridini navbatga qo‘shish xatosi')
+            with db(True) as c:
+                c.execute("UPDATE states SET step='gift_review' WHERE user_id=? AND step='gift_processing'",(uid,))
+            return safe_send(uid,'⚠️ Sovg‘ani tekshirishda xatolik. Qayta urinib ko‘ring.')
+        finally:
+            if not submitted:
+                _PURCHASE_CAPACITY.release()
     if s=='r:copy':
         # Referral menu displays a copyable link; copy button is actual clipboard action.
-        try:uname=bot.get_me().username
+        try:uname=bot_username()
         except Exception:return
         link=f'https://t.me/{uname}?start=ref_{uid}'
         k=types.InlineKeyboardMarkup()
@@ -2082,18 +2346,30 @@ def callbacks(call):
                              if s=='t:self' else '🎁 Qabul qiluvchining @username yoki https://t.me/username havolasini yuboring.'))
     if s=='buy:confirm':
         if not check_access(uid):return
-        step,data=state(uid)
-        if step!='review_order':return safe_send(uid,'Ushbu buyurtma bekor qilingan yoki allaqachon yuborilgan.')
+        if not LIVE_SALES_ENABLED:return safe_send(uid,'Xarid vaqtincha o‘chirilgan.')
         if not read_secret('fragment_key'):return safe_send(uid,'❌ API kaliti sozlanmagan.')
-        ok,reason=safe_price_check(data['kind'],data['qty'],data['total'])
-        if not ok:
-            notify_admin('⚠️ Sotuv tannarxi tekshiruvi: '+esc(reason))
-            return safe_send(uid,'⚠️ Hozir buyurtma berib bo‘lmaydi. Admin narxlarni tekshiradi.')
-        oid,msg=debit_and_create(uid,data)
-        if not oid:return safe_send(uid,'❌ '+esc(msg))
-        safe_send(uid,f'⏳ Buyurtma #{esc(oid)} qabul qilindi. API orqali yuborilmoqda...')
-        process_purchase(oid)  # WSGI: PythonAnywhere web worker fon threadlarini qo‘llab-quvvatlamaydi.
-        return
+        if not _PURCHASE_CAPACITY.acquire(blocking=False):
+            return safe_send(uid,'⏳ Xaridlar navbati band. Qayta urinib ko‘ring.')
+        # Mark claimed INSIDE one transaction. Two rapid clicks cannot debit twice.
+        submitted = False
+        try:
+            with db(True) as c:
+                record=c.execute('SELECT step,data FROM states WHERE user_id=?',(uid,)).fetchone()
+                if not record or record['step']!='review_order':
+                    return safe_send(uid,'⏳ Buyurtma allaqachon tekshirilmoqda yoki bajarilgan.')
+                data=json.loads(record['data'])
+                c.execute("UPDATE states SET step='checking_price' WHERE user_id=?",(uid,))
+            _PURCHASE_POOL.submit(_confirm_purchase_async,uid,data)
+            submitted = True
+            return safe_send(uid,'🔎 Tannarx tekshirilmoqda. Buyurtmani qayta bosmang.')
+        except Exception:
+            logger.exception('Xaridni navbatga qo‘shish xatosi')
+            with db(True) as c:
+                c.execute("UPDATE states SET step='review_order' WHERE user_id=? AND step='checking_price'",(uid,))
+            return safe_send(uid,'⚠️ Xaridni boshlashda xatolik. Qayta urinib ko‘ring.')
+        finally:
+            if not submitted:
+                _PURCHASE_CAPACITY.release()
     if s=='top:menu':return topup_menu(uid)
     if s.startswith('top:sum:'):
         if not check_access(uid):return
@@ -2196,6 +2472,9 @@ def callbacks(call):
         if action=='close':
             with db(True) as c:c.execute('UPDATE tickets SET status=?,updated=? WHERE id=?',('closed',now(),tid))
             return safe_send(uid,'✅ Murojaat yopildi.')
+
+    logger.info('Noma’lum inline tugma user=%s prefix=%s',uid, s.split(':',1)[0][:15])
+    return safe_send(uid,'⚠️ Bu tugma eskirgan. /start orqali menyuni qayta oching.')
 
 
 @bot.message_handler(content_types=['text','photo','video','document','voice','audio','sticker'])
@@ -2309,6 +2588,10 @@ def initialize_runtime():
     global CIPHER
     setup_db()
     CIPHER=init_cipher()
+    # Verification jobs are not monetary debits: recover if Render restarted.
+    with db(True) as c:
+        c.execute("UPDATE states SET step='review_order' WHERE step='checking_price'")
+        c.execute("UPDATE states SET step='gift_review' WHERE step='gift_processing'")
     # O'rtada server to'xtagan buyurtmalarni qayta yubormaymiz.
     # 5 daqiqadan eski processing holati qo'lda tekshirishga yuboriladi.
     cutoff=(datetime.now(timezone.utc)-timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -2339,10 +2622,11 @@ initialize_runtime()  # Gunicorn: from bot import app; DB+shifrlash tayyor.
 
 @app.before_request
 def _ensure_bank_monitor():
-    if PAYMENT_PROVIDER == 'bank_session':
+    if PAYMENT_PROVIDER == 'bank_session' and not HUMO_LISTENER_STARTED.is_set():
         maybe_start_bank_listener()
 
 if 'gunicorn' in os.path.basename(sys.argv[0]).lower():
+    start_broadcast_worker()
     maybe_start_bank_listener()  # Gunicorn --workers 1, worker import only; not CLI set-webhook
 
 application = app
@@ -2372,7 +2656,9 @@ def start_render():
     os.execvp('gunicorn', [
         'gunicorn', '--bind', '0.0.0.0:' + port,
         '--workers', '1', '--threads', '4', '--timeout', '120',
-        '--access-logfile', '-', '--error-logfile', '-', 'bot:app'
+        # Log HTTP status/latency without exposing the secret webhook path.
+        '--access-logfile', '-', '--access-logformat', '%(h)s %(m)s %(s)s %(L)s',
+        '--error-logfile', '-', 'bot:app'
     ])
 
 
