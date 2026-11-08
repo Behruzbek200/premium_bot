@@ -106,6 +106,17 @@ _USER_TOUCH_CACHE = {}
 _USER_TOUCH_LOCK = threading.Lock()
 _CHANNEL_CACHE = {'expires': 0.0, 'rows': ()}
 _CHANNEL_CACHE_LOCK = threading.Lock()
+# Cache only verified memberships. Bot operators may configure a very short TTL.
+# Failed/unknown memberships are NEVER cached as successful.
+try:
+    _SUBSCRIPTION_CACHE_TTL = min(60.0, max(0.0, float(os.getenv('SUBSCRIPTION_CACHE_SECONDS','15'))))
+except (ValueError, OverflowError):
+    _SUBSCRIPTION_CACHE_TTL = 15.0
+_SUBSCRIPTION_CACHE = {}
+_SUBSCRIPTION_CACHE_LOCK = threading.Lock()
+# Reuse permissions and fresh Telegram profile data inside ONE webhook only.
+# This context is reset after processing every update (no stale financial balance).
+_REQUEST_CACHE = contextvars.ContextVar('request_cache', default=None)
 _BOT_USERNAME = None
 _HTTP_LOCAL = threading.local()
 
@@ -252,12 +263,8 @@ DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg2.IntegrityError)
 
 @contextmanager
 def db(write=False, financial=False, webhook_lock=False):
-    """Short PostgreSQL transactions. Global lock ONLY for money or update claims.
-
-    PostgreSQL starts a transaction implicitly on first execute. The old code
-    acquired one advisory lock for EVERY write, blocking /start and buttons
-    behind slow purchases. SQLite retains BEGIN IMMEDIATE for test/demo mode.
-    """
+    """Short PostgreSQL transactions, with per-update DB timing."""
+    _db_started = time.monotonic()
     c = db_open()
     try:
         if write:
@@ -274,7 +281,13 @@ def db(write=False, financial=False, webhook_lock=False):
         c.rollback()
         raise
     finally:
-        c.close()
+        try:
+            c.close()
+        finally:
+            metrics = _WEBHOOK_METRICS.get()
+            if metrics is not None:
+                metrics['db_calls'] += 1
+                metrics['db_ms'] += (time.monotonic() - _db_started)*1000
 
 
 def setup_db():
@@ -416,6 +429,8 @@ def put(k, v):
     if str(k).startswith('channel_'):
         with _CHANNEL_CACHE_LOCK:
             _CHANNEL_CACHE['expires'] = 0.0
+        with _SUBSCRIPTION_CACHE_LOCK:
+            _SUBSCRIPTION_CACHE.clear()
 
 
 def channel_rows():
@@ -500,8 +515,15 @@ def mask_secret(k):
 
 def is_admin(uid):
     if uid == OWNER_ID: return True
+    request_cache = _REQUEST_CACHE.get()
+    key = ('admin', uid)
+    if request_cache is not None and key in request_cache:
+        return request_cache[key]
     with db() as c:
-        return c.execute('SELECT 1 FROM admins WHERE id=?',(uid,)).fetchone() is not None
+        allowed = c.execute('SELECT 1 FROM admins WHERE id=?',(uid,)).fetchone() is not None
+    if request_cache is not None:
+        request_cache[key] = allowed
+    return allowed
 
 
 def only_owner(uid):
@@ -520,9 +542,9 @@ def notify_admin(text, markup=None):
 
 
 def safe_send(uid, text, markup=None):
-    # Old version silently returned None, so webhook returned 200 although
-    # Telegram rejected the bot's reply (400/403/429/etc).
+    """Send message; measure actual Telegram API latency, don't conceal errors."""
     metrics = _WEBHOOK_METRICS.get()
+    started = time.monotonic()
     try:
         result = bot.send_message(uid, text, reply_markup=markup,
                                   disable_web_page_preview=True)
@@ -536,12 +558,18 @@ def safe_send(uid, text, markup=None):
         logger.error('Telegram sendMessage FAILED chat=%s type=%s details=%s',
                      uid, type(exc).__name__, details)
         return None
+    finally:
+        if metrics is not None:
+            metrics['send_ms'] += (time.monotonic() - started)*1000
 
 
 def user_record(u):
     if not u: return
     uid = u.id
     name, username = (u.first_name or '')[:100], (u.username or '')[:100]
+    request_cache = _REQUEST_CACHE.get()
+    if request_cache is not None:
+        request_cache[('profile',uid)] = (name, username)
     stamp = time.monotonic()
     with _USER_TOUCH_LOCK:
         old = _USER_TOUCH_CACHE.get(uid)
@@ -601,8 +629,13 @@ def menu_kb(admin=False):
 # Reply keyboard show, change through /admin, no public admin buttons.
 def main_menu(uid):
     clear_state(uid)
-    r=user_row(uid)
-    name=esc(r['name'] if r else 'do‘stimiz')
+    request_cache = _REQUEST_CACHE.get()
+    profile = request_cache.get(('profile',uid)) if request_cache is not None else None
+    if profile is not None:
+        name = esc(profile[0])
+    else:
+        r = user_row(uid)
+        name = esc(r['name'] if r else 'do‘stimiz')
     greeting=get('welcome').strip() or f'Assalomu alaykum, <b>{name}</b>! 👋\n\n⭐ Stars, 💎 Premium va 🎁 Gift xarid qilish botiga xush kelibsiz!'
     safe_send(uid,greeting+'\n\n🛍 Kerakli bo‘limni tanlang:',menu_kb())
 
@@ -613,24 +646,51 @@ def admin_menu(uid):
 
 
 def needed_subscription(uid):
+    """Check required channels; memoize only recently VERIFIED memberships.
+
+    TTL is deliberately short (default 15s): a user who leaves a channel may
+    retain access until their verified status expires. Channel admin changes
+    invalidate all cached memberships immediately via put('channel_...').
+    """
     channels = channel_rows()
-    if not channels or is_admin(uid): return []
+    if not channels or is_admin(uid):
+        return []
+    # Include configuration in the cache key, so a channel list change cannot
+    # accidentally reuse membership checked against a different channel.
+    active_channels = tuple((r['key'],r['val']) for r in channels if r['val'])
+    if not active_channels:
+        return []
+    key=(uid, active_channels)
+    instant=time.monotonic()
+    metrics=_WEBHOOK_METRICS.get()
+    if _SUBSCRIPTION_CACHE_TTL:
+        with _SUBSCRIPTION_CACHE_LOCK:
+            cached = _SUBSCRIPTION_CACHE.get(key, 0)
+            if cached > instant:
+                if metrics is not None: metrics['sub_cache_hits'] += 1
+                return []
     missing=[]
-    for r in channels:
-        val=r['val']
-        if not val: continue
+    for _, val in active_channels:
         parts=val.split('|',1)
         chat=parts[0]
         link=parts[1] if len(parts)>1 else ''
+        started=time.monotonic()
         try:
             cm=bot.get_chat_member(chat,uid)
             if cm.status not in ('creator','administrator','member') and not (cm.status=='restricted' and getattr(cm,'is_member',False)):
                 missing.append((chat,link))
         except Exception:
-            # kanal adminligi sozlanmagan bo'lishi mumkin; adminlarga xabar beriladi
             missing.append((chat,link))
+        finally:
+            if metrics is not None:
+                metrics['sub_checks'] += 1
+                metrics['sub_ms'] += (time.monotonic()-started)*1000
+    if not missing and _SUBSCRIPTION_CACHE_TTL:
+        with _SUBSCRIPTION_CACHE_LOCK:
+            if len(_SUBSCRIPTION_CACHE) > 16000:
+                _SUBSCRIPTION_CACHE.clear()
+            _SUBSCRIPTION_CACHE[key] = time.monotonic()+_SUBSCRIPTION_CACHE_TTL
     return missing
-
 
 def sub_prompt(uid, missing):
     k=types.InlineKeyboardMarkup()
@@ -643,16 +703,23 @@ def sub_prompt(uid, missing):
 
 
 def check_access(uid):
+    request_cache = _REQUEST_CACHE.get()
+    key=('access',uid)
+    if request_cache is not None and key in request_cache:
+        return request_cache[key]
     u=user_row(uid)
     if u and u['banned'] and uid!=OWNER_ID:
+        if request_cache is not None: request_cache[key]=False
         safe_send(uid,'🚫 Hisobingiz vaqtincha bloklangan.'); return False
     missing=needed_subscription(uid)
     if missing:
+        if request_cache is not None: request_cache[key]=False
         sub_prompt(uid,missing); return False
     if get('maintenance')=='1' and not is_admin(uid):
+        if request_cache is not None: request_cache[key]=False
         safe_send(uid,'🛠 Botda texnik xizmat ishlari olib borilmoqda.'); return False
+    if request_cache is not None: request_cache[key]=True
     return True
-
 
 def stars_menu(uid):
     if not check_access(uid): return
@@ -1362,8 +1429,9 @@ def referral_menu(uid):
     try:uname=bot_username()
     except Exception:return safe_send(uid,'Havolani olishda xatolik. Keyinroq urinib ko‘ring.')
     with db() as c:
-        count=c.execute('SELECT COUNT(*) n FROM referrals WHERE referrer_id=?',(uid,)).fetchone()['n']
-        r=c.execute('SELECT referral_balance FROM users WHERE id=?',(uid,)).fetchone()
+        row=c.execute("""SELECT u.referral_balance,
+            (SELECT COUNT(*) FROM referrals WHERE referrer_id=u.id) AS ref_count
+            FROM users u WHERE u.id=?""",(uid,)).fetchone()
     link=f'https://t.me/{uname}?start=ref_{uid}'
     k=types.InlineKeyboardMarkup()
     k.row(types.InlineKeyboardButton('📋 Havolani nusxalash', copy_text=types.CopyTextButton(text=link)))
@@ -1371,12 +1439,10 @@ def referral_menu(uid):
     k.row(types.InlineKeyboardButton('🏠 Bosh menyu',callback_data='home'))
     return safe_send(uid,'👥 <b>Referal dasturi</b>\n\n'
                      f'🔗 Havolangiz:\n<code>{esc(link)}</code>\n\n'
-                     f'👤 Takliflar: <b>{count}</b>\n'
-                     f'🎁 Bonus balans: <b>{money(r["referral_balance"] if r else 0)}</b>\n'
+                     f'👤 Takliflar: <b>{row["ref_count"] if row else 0}</b>\n'
+                     f'🎁 Bonus balans: <b>{money(row["referral_balance"] if row else 0)}</b>\n'
                      f'💸 Xariddan bonus: <b>{param("referral_percent")}%</b>\n\n'
-                     'Do‘stingizning muvaffaqiyatli xarididan so‘ng bonus yoziladi.',
-                     k)
-
+                     'Do‘stingizning muvaffaqiyatli xarididan so‘ng bonus yoziladi.', k)
 
 def referral_transfer(uid):
     with db(True, financial=True) as c:
@@ -1860,20 +1926,23 @@ def balance_history(uid):
 
 
 def profile(uid):
-    r=user_row(uid)
-    if not r:return
+    # One network round trip to Supabase, not two separate queries.
     with db() as c:
-        x=c.execute("SELECT COUNT(*) as n, COALESCE(SUM(CASE WHEN status='completed' THEN price ELSE 0 END),0) AS sold FROM orders WHERE user_id=?",(uid,)).fetchone()
+        r=c.execute("""SELECT u.*,
+            (SELECT COUNT(*) FROM orders o WHERE o.user_id=u.id) AS order_count,
+            (SELECT COALESCE(SUM(CASE WHEN o.status='completed' THEN o.price ELSE 0 END),0)
+             FROM orders o WHERE o.user_id=u.id) AS sold
+            FROM users u WHERE u.id=?""", (uid,)).fetchone()
+    if not r:return
     safe_send(uid,f'💰 <b>Hisobim</b>\n\n👤 {esc(r["name"])}\n'
               f'🔗 @{esc(r["username"] or "username yo‘q")}\n'
               f'💳 Balans: <b>{money(r["balance"])}</b>\n'
-              f'📦 Buyurtmalar: {x["n"]} ta\n🛍 Bajarilgan xarid: {money(x["sold"])}\n\n'
+              f'📦 Buyurtmalar: {r["order_count"]} ta\n🛍 Bajarilgan xarid: {money(r["sold"])}\n\n'
               '📣 Isbotlar kanalida xarid turi va miqdori ko‘rsatilishi mumkin. '
               'Ismingiz faqat ruxsat bersangiz ochiq chiqadi.',
               keyboard([[('🧾 Tranzaksiyalar tarixi','u:ledger')],[('💳 Hisob to‘ldirish','top:menu')],
                         [(('🟢 Ismim ochiq — maxfiy qilish' if r['proof_opt_in'] else
                            '🔒 Ismim maxfiy — ochiq qilish'),'u:proof:toggle')]]))
-
 
 def report_ticket(uid, m):
     with db(True) as c:
@@ -2198,6 +2267,8 @@ def handle_admin_input(m,data):
             if not found:raise ValueError('Kanal topilmadi.')
             with _CHANNEL_CACHE_LOCK:
                 _CHANNEL_CACHE['expires'] = 0.0
+            with _SUBSCRIPTION_CACHE_LOCK:
+                _SUBSCRIPTION_CACHE.clear()
         elif k in ('admin_add','admin_del'):
             n=int(value)
             if n<=0 or n==OWNER_ID:raise ValueError('Bosh adminni o‘zgartirish mumkin emas.')
@@ -2384,9 +2455,11 @@ def telegram_webhook(token):
             c.execute('INSERT INTO telegram_updates(update_id,status,arrived) VALUES(?,?,?)',
                       (update_id,'processing',now()))
     started = time.monotonic()
-    metrics = {'sent': 0, 'failed': 0}
+    metrics = {'sent': 0, 'failed': 0, 'db_calls': 0, 'db_ms': 0.0,
+               'send_ms': 0.0, 'sub_checks': 0, 'sub_ms': 0.0, 'sub_cache_hits': 0}
     kind = next((k for k in ('message','callback_query','pre_checkout_query') if k in raw), 'other')
     token_metrics = _WEBHOOK_METRICS.set(metrics)
+    token_request = _REQUEST_CACHE.set({})
     logger.info('Webhook IN update=%s kind=%s', update_id, kind)
     try:
         chat_uid = 0
@@ -2405,10 +2478,14 @@ def telegram_webhook(token):
         # Fail-closed: API buyurtma bajarilgan-bajarilmagan noma'lum bo'lishi mumkin.
         return jsonify({'ok':False,'error':'update failed; manual review'}),500
     finally:
+        _REQUEST_CACHE.reset(token_request)
         _WEBHOOK_METRICS.reset(token_metrics)
-        logger.info('Webhook OUT update=%s kind=%s send_ok=%s send_failed=%s duration_ms=%s',
+        logger.info('Webhook OUT update=%s kind=%s send_ok=%s send_failed=%s duration_ms=%s '
+                    'db_calls=%s db_ms=%s send_ms=%s sub_checks=%s sub_ms=%s sub_cache_hits=%s',
                     update_id, kind, metrics['sent'], metrics['failed'],
-                    int((time.monotonic()-started)*1000))
+                    int((time.monotonic()-started)*1000), metrics['db_calls'],
+                    round(metrics['db_ms']), round(metrics['send_ms']),
+                    metrics['sub_checks'], round(metrics['sub_ms']),metrics['sub_cache_hits'])
     # Read-only menu requests should not be acknowledged as delivered if no
     # Telegram message was accepted; they may safely be retried. Purchase and
     # payment callbacks are NEVER auto-replayed on uncertain outcomes.
@@ -2642,6 +2719,11 @@ def callbacks(call):
         set_state(uid,'admin_stars_deposit')
         return safe_send(uid,'⭐ Nechta Starsni bot hisobiga o‘tkazasiz? (1–100 000):')
     if s=='sub:check':
+        # The explicit verification button always checks Telegram live.
+        with _SUBSCRIPTION_CACHE_LOCK:
+            for cache_key in list(_SUBSCRIPTION_CACHE):
+                if cache_key[0] == uid:
+                    del _SUBSCRIPTION_CACHE[cache_key]
         if check_access(uid):main_menu(uid)
         return
     if s=='home':return main_menu(uid)
