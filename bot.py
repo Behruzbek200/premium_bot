@@ -2,7 +2,7 @@
 """Stars, Premium, 11 Gifts, referral and HUMO shop — Render + Supabase.
 
 Single application file. Live sales REQUIRES a permanent PostgreSQL DATABASE_URL,
-APP_SECRET and verified real payment/delivery tests. PostgreSQL serializes balance
+a stable BOT_TOKEN and verified real payment/delivery tests. PostgreSQL serializes balance
 mutations across workers via transaction-scoped advisory locks. Local SQLite is
 only used for offline demonstrations when DATABASE_URL is absent and live sales
 are disabled. @HUMOcardbot via Telethon StringSession is a bank *notification*,
@@ -79,8 +79,6 @@ if DATABASE_URL and not DATABASE_URL.startswith(('postgresql://','postgres://'))
     raise SystemExit('DATABASE_URL PostgreSQL ulanish manzili bo‘lishi kerak.')
 if LIVE_SALES_ENABLED and not USE_POSTGRES:
     raise SystemExit('ENABLE_LIVE_SALES=1 uchun PostgreSQL DATABASE_URL majburiy.')
-if USE_POSTGRES and not os.getenv('APP_SECRET','').strip():
-    raise SystemExit('PostgreSQL rejimi uchun barqaror APP_SECRET (Fernet key) majburiy.')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('stars_shop')
@@ -331,20 +329,26 @@ def stars_total(qty, unit_price=None):
 
 
 def init_cipher():
-    secret = os.getenv('APP_SECRET', '').strip()
-    if not secret and USE_POSTGRES:
-        raise SystemExit('APP_SECRET talab qilinadi: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"')
+    """Stable Fernet key without extra ENV settings.
+
+    Existing APP_SECRET is still accepted for backwards compatibility, but
+    new installations need only BOT_TOKEN. Since rotating BOT_TOKEN changes
+    the derived key, re-enter Fragment API Key in /admin after token rotation.
+    """
+    secret = os.getenv('APP_SECRET', '').strip()  # optional legacy setting
     if not secret:
-        # Mahalliy SQLite uchun bir xil bot tokenidan barqaror kalit hosil qilamiz.
-        # Bu APP_SECRET o'rnini xavfsizlik jihatdan to'liq bosa olmaydi.
-        # Token almashtirilsa Fragment API kalitini qayta kiriting.
         import base64
-        secret = base64.urlsafe_b64encode(hashlib.sha256(b'stars-humo-local-fernet-v1:' + BOT_TOKEN.encode()).digest()).decode()
-        logger.warning('APP_SECRET yo‘q: SQLite uchun BOT_TOKEN asosida lokal kalit yaratildi; productionda alohida APP_SECRET tavsiya qilinadi.')
+        secret = base64.urlsafe_b64encode(
+            hashlib.sha256(b'stars-humo-local-fernet-v1:' + BOT_TOKEN.encode()).digest()
+        ).decode()
+        logger.warning(
+            'Fragment kaliti BOT_TOKEN dan olingan kalit bilan shifrlanadi. '
+            'BOT_TOKEN o‘zgarsa /admin orqali Fragment API Key ni qayta kiriting.'
+        )
     try:
         return Fernet(secret.encode())
     except (ValueError, TypeError) as exc:
-        raise SystemExit('APP_SECRET noto‘g‘ri: Fernet.generate_key() qiymatini kiriting.') from exc
+        raise SystemExit('Oldingi ixtiyoriy APP_SECRET noto‘g‘ri formatda.') from exc
 
 
 CIPHER = None
