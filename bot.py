@@ -27,6 +27,7 @@ import logging
 import sqlite3
 import psycopg2
 from psycopg2 import extras as pg_extras
+from psycopg2.pool import ThreadedConnectionPool
 import threading
 import asyncio
 import sys
@@ -102,6 +103,27 @@ def esc(s):
 
 
 
+# Avoid opening a fresh Supabase TLS connection for every menu/DB query.
+# One thread-safe pool per Render worker process. Transactions are still
+# committed or rolled back on each request before returning connections.
+_PG_POOL = None
+_PG_POOL_PID = None
+_PG_POOL_LOCK = threading.Lock()
+
+
+def _pg_pool():
+    global _PG_POOL, _PG_POOL_PID
+    pid = os.getpid()
+    with _PG_POOL_LOCK:
+        if _PG_POOL is None or _PG_POOL_PID != pid:
+            _PG_POOL = ThreadedConnectionPool(
+                minconn=1, maxconn=8, dsn=DATABASE_URL,
+                connect_timeout=12, application_name='stars-premium-gift-shop'
+            )
+            _PG_POOL_PID = pid
+        return _PG_POOL
+
+
 class PGConnection:
     """SQLite-shaped DB methods backed by psycopg2 and PostgreSQL.
 
@@ -110,8 +132,8 @@ class PGConnection:
     converted from SQLite ? to PostgreSQL %s. This also supports old schema.
     """
     def __init__(self):
-        self.conn = psycopg2.connect(DATABASE_URL, connect_timeout=12,
-                                      application_name='stars-premium-gift-shop')
+        self._pool = _pg_pool()
+        self.conn = self._pool.getconn()
         self.cur = None
         self.lastrowid = None
         self.rowcount = -1
@@ -138,8 +160,13 @@ class PGConnection:
         self.cur=self.conn.cursor(cursor_factory=pg_extras.RealDictCursor)
         # psycopg2 uses '%' as a formatting marker. SQL LIKE patterns such as
         # 'BANK:%' and 'channel_%' must be escaped before ? -> %s conversion.
-        q=q.replace('%','%%').replace('?','%s')
-        self.cur.execute(q,params if params else None)
+        # Only double SQL literal '%' when psycopg2 is formatting parameters.
+        # With zero parameters a LIKE 'channel_%' pattern must remain intact.
+        has_params = bool(params)
+        if has_params:
+            q = q.replace('%','%%')
+        q=q.replace('?','%s')
+        self.cur.execute(q,params if has_params else None)
         self.rowcount=self.cur.rowcount
         self.lastrowid=self.cur.fetchone()['id'] if returns_ticket_id else None
         return self
@@ -163,8 +190,12 @@ class PGConnection:
     def commit(self):self.conn.commit()
     def rollback(self):self.conn.rollback()
     def close(self):
-        if self.cur is not None:self.cur.close()
-        self.conn.close()
+        try:
+            if self.cur is not None:
+                self.cur.close()
+        finally:
+            # Discard dead connections; healthy ones are reused.
+            self._pool.putconn(self.conn, close=bool(self.conn.closed))
 
 
 def db_open():
@@ -749,7 +780,10 @@ def gift_row(slot):
 
 def gift_catalog(uid):
     if not check_access(uid):return
-    with db() as c:rows=c.execute('SELECT * FROM gifts WHERE enabled=1 AND price>0 AND gift_id!="" ORDER BY slot').fetchall()
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM gifts WHERE enabled=1 AND price>0 AND gift_id<>'' ORDER BY slot"
+        ).fetchall()
     if not rows:
         return safe_send(uid,'🎁 Sovg‘alar tez orada sotuvga qo‘yiladi.')
     rows_k=[[(f'{x["emoji"]} {x["name"]} — {money(x["price"])}',f'g:view:{x["slot"]}')]
