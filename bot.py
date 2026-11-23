@@ -104,6 +104,12 @@ _CATALOG_CACHE_LOCK = threading.Lock()
 _SETTING_CACHE = {}
 _SETTING_CACHE_LOCK = threading.Lock()
 _SETTINGS_TTL = 12.0
+# Faqat o'qiydigan menyu/buyruq update'lari uchun xotirada dedup: Supabase'ga 2 ta
+# tranzaksiya (kirish + 'done') o'rniga 0 ta DB aylanishi. Pul/buyurtma update'lari
+# eskicha DB dedup bilan qoladi.
+_FAST_SEEN = {}
+_FAST_SEEN_LOCK = threading.Lock()
+_FAST_SEEN_TTL = 600.0
 _USER_TOUCH_CACHE = {}
 _USER_TOUCH_LOCK = threading.Lock()
 _CHANNEL_CACHE = {'expires': 0.0, 'rows': ()}
@@ -2665,29 +2671,45 @@ def telegram_webhook(token):
         update=telebot.types.Update.de_json(json.dumps(raw))
     except (KeyError,ValueError,TypeError):
         return jsonify({'ok':False,'error':'invalid update'}),400
-    # Xuddi shu update Telegram tomonidan takror yuborilsa, ikki marta bajarmaymiz.
-    with db(True, webhook_lock=True) as c:
-        row=c.execute('SELECT status,arrived FROM telegram_updates WHERE update_id=?',(update_id,)).fetchone()
-        if row:
-            if row['status']=='done':
+    _msg = raw.get('message') if isinstance(raw.get('message'), dict) else None
+    _txt = str((_msg or {}).get('text') or '').strip()
+    _cmd = _txt.split(' ', 1)[0].split('@', 1)[0]
+    fast_path = bool(_msg) and (_cmd in {'/start','/id','/menu','/terms','/paysupport'} or _txt in {
+        '⭐ Stars olish','💎 Premium olish','👥 Referal','🎁 Gift olish','💰 Hisobim',
+        '💳 Hisob to‘ldirish','📦 Buyurtmalarim','🎧 Yordam','🏠 User menyu','🏠 Bosh menyu','⬅️ Orqaga'})
+    if fast_path:
+        _t = time.monotonic()
+        with _FAST_SEEN_LOCK:
+            if len(_FAST_SEEN) > 5000:
+                for k in [k for k, v in _FAST_SEEN.items() if v < _t]:
+                    _FAST_SEEN.pop(k, None)
+            if _FAST_SEEN.get(update_id, 0) > _t:
                 return jsonify({'ok':True,'duplicate':True})
-            if row['status']=='processing':
-                # Don't acknowledge a concurrent retry while the first worker
-                # may still be handling a payment or delivery callback.
-                try:
-                    started=datetime.strptime(row['arrived'],'%Y-%m-%d %H:%M:%S UTC').replace(tzinfo=timezone.utc)
-                    active=(datetime.now(timezone.utc)-started).total_seconds()<300
-                except (ValueError,TypeError):
-                    active=False
-                if active:
-                    return jsonify({'ok':False,'retry_later':True}),503
-            # Failed/stale updates can be retried. Order/bank ledger state has
-            # separate idempotency keys; never auto-retry uncertain deliveries.
-            c.execute('UPDATE telegram_updates SET status=?,arrived=? WHERE update_id=?',
-                      ('processing',now(),update_id))
-        else:
-            c.execute('INSERT INTO telegram_updates(update_id,status,arrived) VALUES(?,?,?)',
-                      (update_id,'processing',now()))
+            _FAST_SEEN[update_id] = _t + _FAST_SEEN_TTL
+    # Xuddi shu update Telegram tomonidan takror yuborilsa, ikki marta bajarmaymiz.
+    if not fast_path:
+      with db(True, webhook_lock=True) as c:
+          row=c.execute('SELECT status,arrived FROM telegram_updates WHERE update_id=?',(update_id,)).fetchone()
+          if row:
+              if row['status']=='done':
+                  return jsonify({'ok':True,'duplicate':True})
+              if row['status']=='processing':
+                  # Don't acknowledge a concurrent retry while the first worker
+                  # may still be handling a payment or delivery callback.
+                  try:
+                      started=datetime.strptime(row['arrived'],'%Y-%m-%d %H:%M:%S UTC').replace(tzinfo=timezone.utc)
+                      active=(datetime.now(timezone.utc)-started).total_seconds()<300
+                  except (ValueError,TypeError):
+                      active=False
+                  if active:
+                      return jsonify({'ok':False,'retry_later':True}),503
+              # Failed/stale updates can be retried. Order/bank ledger state has
+              # separate idempotency keys; never auto-retry uncertain deliveries.
+              c.execute('UPDATE telegram_updates SET status=?,arrived=? WHERE update_id=?',
+                        ('processing',now(),update_id))
+          else:
+              c.execute('INSERT INTO telegram_updates(update_id,status,arrived) VALUES(?,?,?)',
+                        (update_id,'processing',now()))
     started = time.monotonic()
     metrics = {'sent': 0, 'failed': 0, 'db_calls': 0, 'db_ms': 0.0,
                'send_ms': 0.0, 'sub_checks': 0, 'sub_ms': 0.0, 'sub_cache_hits': 0}
@@ -2707,8 +2729,12 @@ def telegram_webhook(token):
             bot.process_new_updates([update])
     except Exception:
         logger.exception('Telegram webhook update failed: %s',update_id)
-        with db(True, webhook_lock=True) as c:
-            c.execute("UPDATE telegram_updates SET status='failed' WHERE update_id=?",(update_id,))
+        if fast_path:
+            with _FAST_SEEN_LOCK:
+                _FAST_SEEN.pop(update_id, None)
+        else:
+            with db(True, webhook_lock=True) as c:
+                c.execute("UPDATE telegram_updates SET status='failed' WHERE update_id=?",(update_id,))
         # Fail-closed: API buyurtma bajarilgan-bajarilmagan noma'lum bo'lishi mumkin.
         return jsonify({'ok':False,'error':'update failed; manual review'}),500
     finally:
@@ -2733,9 +2759,15 @@ def telegram_webhook(token):
     if should_reply and (metrics['failed'] or metrics['sent'] == 0):
         logger.warning('Bot menu reply unavailable: update=%s text=%s sent=%s failed=%s',
                        update_id, raw_text[:32], metrics['sent'], metrics['failed'])
-        with db(True, webhook_lock=True) as c:
-            c.execute("UPDATE telegram_updates SET status='failed' WHERE update_id=?",(update_id,))
+        if fast_path:
+            with _FAST_SEEN_LOCK:
+                _FAST_SEEN.pop(update_id, None)
+        else:
+            with db(True, webhook_lock=True) as c:
+                c.execute("UPDATE telegram_updates SET status='failed' WHERE update_id=?",(update_id,))
         return jsonify({'ok':False,'retry':'sendMessage unavailable'}),503
+    if fast_path:
+        return jsonify({'ok':True})
     with db(True, webhook_lock=True) as c:
         c.execute("UPDATE telegram_updates SET status='done' WHERE update_id=?",(update_id,))
         # Cheklanmagan ko'payishni oldini olish (so'nggi 20 ming update saqlanadi).
