@@ -69,6 +69,8 @@ TELETHON_STRING_SESSION = os.getenv('TELETHON_STRING_SESSION','').strip()
 # ID kiritish shart emas: Telethon @HUMOcardbot username orqali aniq topadi.
 HUMO_BOT_USERNAME = os.getenv('HUMO_BOT_USERNAME','HUMOcardbot').strip().lstrip('@')
 HUMO_SENDER_ID = int(os.getenv('HUMO_SENDER_ID','0'))
+HUMO_SENDER_ID_PINNED = HUMO_SENDER_ID  # ENV dagi qiymat; qayta ulanishda global o'zgarsa ham asl pin saqlanadi
+HUMO_LAST_ERROR = ''  # /bankstatus da oxirgi xato ko'rinadi
 HUMO_CARD_LAST4 = os.getenv('HUMO_CARD_LAST4','').strip()
 HUMO_AUTO_CREDIT = os.getenv('HUMO_AUTO_CREDIT','1') == '1'
 HUMO_LISTENER_STARTED = threading.Event()
@@ -1921,19 +1923,22 @@ def approve_bank_payment(uid, pid):
 
 def telethon_listener_worker():
     async def run():
-        global HUMO_SENDER_ID
+        global HUMO_SENDER_ID, HUMO_LAST_ERROR
         async with TelegramClient(StringSession(TELETHON_STRING_SESSION), TELEGRAM_API_ID, TELEGRAM_API_HASH) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError('StringSession bekor qilingan, yangisini kiriting')
-            bank_entity = await client.get_entity(HUMO_SENDER_ID or HUMO_BOT_USERNAME)
+            # StringSession entity keshini saqlamaydi: son bilan qidirish qayta ulanishda
+            # ValueError beradi. Shuning uchun HAR DOIM username orqali aniqlaymiz.
+            bank_entity = await client.get_entity(HUMO_BOT_USERNAME)
             # Username orqali faqat aniq @HUMOcardbot identifikatori olinadi.
             uname = (getattr(bank_entity,'username',None) or '').lower()
             if uname != HUMO_BOT_USERNAME.lower():
                 raise RuntimeError('Bank bot username mos emas, listener to‘xtatildi')
-            if HUMO_SENDER_ID and int(bank_entity.id) != HUMO_SENDER_ID:
+            if HUMO_SENDER_ID_PINNED and int(bank_entity.id) != HUMO_SENDER_ID_PINNED:
                 raise RuntimeError('Bank botning numeric ID raqami mos emas')
             HUMO_SENDER_ID = int(bank_entity.id)
             HUMO_LISTENER_CONNECTED.set()
+            HUMO_LAST_ERROR = ''
             logger.info('Telethon @%s ulandi, sender_id=%s', HUMO_BOT_USERNAME, HUMO_SENDER_ID)
             # Recover recently missed notifications after deployment or reconnect.
             # The persistent unique bank_events + invoice timestamp guard prevent replay credits.
@@ -1963,14 +1968,28 @@ def telethon_listener_worker():
             await client.run_until_disconnected()
     # Keep retrying on network failures. The thread is a daemon owned by the
     # single Gunicorn worker, not a Render scheduled background job.
+    global HUMO_LAST_ERROR
+    delay = 15
     while True:
+        started = time.monotonic()
+        flood = False
         try:
             asyncio.run(run())
-        except Exception:
+            HUMO_LAST_ERROR = 'Ulanish uzildi (xatosiz), qayta ulanilmoqda'
+        except Exception as exc:
+            HUMO_LAST_ERROR = (type(exc).__name__ + ': ' + str(exc))[:300]
             logger.exception('Telethon listener uzildi; qayta ulanadi')
+            wait = getattr(exc, 'seconds', None)  # FloodWaitError
+            if isinstance(wait, int) and wait > 0:
+                flood = True
+                delay = min(wait + 5, 3600)
         finally:
             HUMO_LISTENER_CONNECTED.clear()
-        time.sleep(15)
+        if not flood and time.monotonic() - started > 300:
+            delay = 15  # barqaror ishlagan edi: kutishni qayta boshlaymiz
+        time.sleep(delay)
+        if not flood:
+            delay = min(delay * 2, 300)
 
 
 _HUMO_CHECK_NEXT = 0.0
@@ -2766,7 +2785,10 @@ def bank_commands(m):
     if m.chat.type!='private' or m.from_user.id!=OWNER_ID:return
     if m.text.strip().startswith('/bankstatus'):
         status='✅ Ulangan' if HUMO_LISTENER_CONNECTED.is_set() else '❌ Ulanmagan'
-        return safe_send(m.chat.id,f'🏦 HUMO kuzatuv: {status}\nProvayder: {esc(PAYMENT_PROVIDER)}\nAvto kredit: {HUMO_AUTO_CREDIT}\nSender ID: {HUMO_SENDER_ID}\nKarta: ****{esc(expected_humo_last4())}')
+        alive = any(t.name == 'humo-listener' and t.is_alive() for t in threading.enumerate())
+        thread_txt = 'bor' if alive else 'YO‘Q'
+        last_err = esc(HUMO_LAST_ERROR or 'yo‘q')
+        return safe_send(m.chat.id,f'🏦 HUMO kuzatuv: {status}\nProvayder: {esc(PAYMENT_PROVIDER)}\nAvto kredit: {HUMO_AUTO_CREDIT}\nSender ID: {HUMO_SENDER_ID}\nKarta: ****{esc(expected_humo_last4())}\nPID: {os.getpid()} | listener thread: {thread_txt}\nOxirgi xato: {last_err}')
     parts=m.text.strip().split()
     if len(parts)!=2:return safe_send(m.chat.id,'Format: /bankapprove BXXXXXXXXXXXXXXX')
     return safe_send(m.chat.id,esc(approve_bank_payment(m.from_user.id,parts[1])))
