@@ -1982,7 +1982,7 @@ def telethon_listener_worker():
         try:
             asyncio.run(run())
             HUMO_LAST_ERROR = 'Ulanish uzildi (xatosiz), qayta ulanilmoqda'
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             HUMO_LAST_ERROR = (type(exc).__name__ + ': ' + str(exc))[:300]
             logger.exception('Telethon listener uzildi; qayta ulanadi')
             wait = getattr(exc, 'seconds', None)  # FloodWaitError
@@ -2000,19 +2000,49 @@ def telethon_listener_worker():
 
 _HUMO_CHECK_NEXT = 0.0
 _HUMO_CHECK_LOCK = threading.Lock()
+_HUMO_THREAD = None
+_HUMO_THREAD_PID = None
+
+
+def _humo_thread_alive():
+    t = _HUMO_THREAD
+    return t is not None and _HUMO_THREAD_PID == os.getpid() and t.is_alive()
+
+
+def _humo_reset_after_fork():
+    """Gunicorn fork: threadlar bolaga o'tmaydi, lekin Event/Lock holati o'tadi.
+    Shuning uchun worker'da hammasini nolga qaytaramiz va listener'ni o'zi ishga tushiradi."""
+    global HUMO_LISTENER_STARTED, HUMO_LISTENER_CONNECTED, _HUMO_CHECK_LOCK, _HUMO_CHECK_NEXT
+    global _HUMO_THREAD, _HUMO_THREAD_PID
+    HUMO_LISTENER_STARTED = threading.Event()
+    HUMO_LISTENER_CONNECTED = threading.Event()
+    _HUMO_CHECK_LOCK = threading.Lock()
+    _HUMO_CHECK_NEXT = 0.0
+    _HUMO_THREAD = None
+    _HUMO_THREAD_PID = None
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_humo_reset_after_fork)
+
 
 def maybe_start_bank_listener():
     # Monitoring may connect while live sales is OFF: /bankstatus can be
     # checked without accepting actual money. Crediting itself remains gated.
-    global _HUMO_CHECK_NEXT
-    if PAYMENT_PROVIDER != 'bank_session' or HUMO_LISTENER_STARTED.is_set():return
+    # Listener faqat shu jarayonda (pid) tirik thread bo'lmasa ishga tushadi.
+    global _HUMO_CHECK_NEXT, _HUMO_THREAD, _HUMO_THREAD_PID
+    if PAYMENT_PROVIDER != 'bank_session' or _humo_thread_alive():return
     with _HUMO_CHECK_LOCK:
-        if HUMO_LISTENER_STARTED.is_set() or time.monotonic() < _HUMO_CHECK_NEXT:
+        if _humo_thread_alive() or time.monotonic() < _HUMO_CHECK_NEXT:
             return
         _HUMO_CHECK_NEXT = time.monotonic()+20.0
         if not bank_configured():return
+        HUMO_LISTENER_CONNECTED.clear()
+        t = threading.Thread(target=telethon_listener_worker,name='humo-listener',daemon=True)
+        _HUMO_THREAD = t
+        _HUMO_THREAD_PID = os.getpid()
         HUMO_LISTENER_STARTED.set()
-    threading.Thread(target=telethon_listener_worker,name='humo-listener',daemon=True).start()
+        t.start()
 
 
 
@@ -3391,14 +3421,22 @@ initialize_runtime()  # Gunicorn: from bot import app; DB+shifrlash tayyor.
 
 @app.before_request
 def _ensure_bank_monitor():
-    if PAYMENT_PROVIDER == 'bank_session' and not HUMO_LISTENER_STARTED.is_set():
+    if PAYMENT_PROVIDER == 'bank_session' and not _humo_thread_alive():
         maybe_start_bank_listener()
 
 if 'gunicorn' in os.path.basename(sys.argv[0]).lower():
     start_broadcast_worker()
     start_menu_refresh_worker()
     start_wallet_retry_worker()
-    maybe_start_bank_listener()  # Gunicorn --workers 1, worker import only; not CLI set-webhook
+    # --preload bo'lsa import master'da bo'ladi; thread fork'dan keyin yo'qoladi.
+    # Master'da ishga tushirmaymiz: worker'ni before_request / fork hook ishga tushiradi.
+    try:
+        with open('/proc/%d/cmdline' % os.getppid(), 'rb') as _f:
+            _in_worker = b'gunicorn' in _f.read()
+    except Exception:
+        _in_worker = True
+    if _in_worker:
+        maybe_start_bank_listener()
 
 application = app
 
